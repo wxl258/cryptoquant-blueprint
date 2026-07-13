@@ -32,10 +32,10 @@
 
 - **远程**:`https://github.com/wxl258/cryptoquant-blueprint.git`
 - **默认分支**:`main`
-- **最新提交**:`4285c13`(P2 收尾 + 部署 + CI 守门)
-- **CI**:已随 `4285c13` 推送自动触发,去 **Actions** 看 `CI` 工作流
+- **最新提交**:`4285c13`(P2 收尾 + 部署 + CI 守门);**后续修复提交**:修复 `tsfm.py` 降级路径参数兼容,使 GitHub Actions 全绿
+- **CI**:已随 `4285c13` 推送自动触发;**首次 GitHub runner 失败**(干净环境缺 `torch`,`make_tsfm` 降级到 `DistilledTSFM` 时误传 `epochs` 参数) → **已修复**,去 **Actions** 看 `CI` 工作流
 - **本地工作树**:干净(本文件除外,见末尾提交说明)
-- **本地模拟 CI 全链**:`ALL GREEN`(pytest 63 + verify 12 + stage4/3/0.5 ✅)
+- **本地模拟 CI 全链**:干净 venv(仅 `pytest+numpy`) 复现并修复后 `ALL GREEN`(pytest 63 + verify 12 + stage4/3/0.5 ✅)
 
 ---
 
@@ -44,6 +44,7 @@
 | 路径 | 作用 |
 |------|------|
 | `.github/workflows/ci.yml` | CI 守门:pytest + verify_p1_fixes + 三验证阶段 |
+| `cryptoquant_auto/signals/tsfm.py` | TSFM 时序模型;缺 `torch` 时降级到 numpy(本次修复降级参数兼容) |
 | `cryptoquant_auto/util/logging_setup.py` | 日志落盘(RotatingFileHandler,幂等) |
 | `cryptoquant_auto/demo_sections.py` | 从 demo.py 抽离的分析块(回归/回测/OOS/regime/testnet) |
 | `cryptoquant_auto/demo.py` | 主入口(已瘦身为 435 行) |

@@ -285,6 +285,11 @@ class PretrainedTSFM(TSFMForecaster):
             "接口已对齐：返回 (point, lower, upper)。")
 
 
+def _numpy_kwargs(kw: dict) -> dict:
+    """DistilledTSFM 只理解这些参数;其它为 torch/pretrained 后端专属,降级时剥离。"""
+    return {k: v for k, v in kw.items() if k in {"lookback", "alpha", "ridge", "seed"}}
+
+
 def make_tsfm(backend: str = "auto", **kw) -> TSFMForecaster:
     """统一入口：auto 优先 torch，缺失/失败 → numpy 降级（纪律：torch 可选 + 降级）。
 
@@ -292,19 +297,19 @@ def make_tsfm(backend: str = "auto", **kw) -> TSFMForecaster:
     加载失败/缺失时由调用方降级到 numpy（见 run_validation_stage4 的 A/B 降级逻辑）。
     """
     if backend == "numpy":
-        return DistilledTSFM(**kw)
+        return DistilledTSFM(**_numpy_kwargs(kw))
     if backend == "torch":
         try:
             return TorchTSFM(**kw)
         except ImportError:
-            return DistilledTSFM(**kw)   # 降级路径
+            return DistilledTSFM(**_numpy_kwargs(kw))   # 降级路径
     if backend == "pretrained":
         try:
             return PretrainedTSFM(**kw)
         except Exception:
-            return DistilledTSFM(**kw)   # 降级路径
+            return DistilledTSFM(**_numpy_kwargs(kw))   # 降级路径
     # auto
     try:
         return TorchTSFM(**kw)
     except ImportError:
-        return DistilledTSFM(**kw)
+        return DistilledTSFM(**_numpy_kwargs(kw))
