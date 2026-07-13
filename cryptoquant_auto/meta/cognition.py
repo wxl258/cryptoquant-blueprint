@@ -8,12 +8,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-BASE_DIR = os.environ.get("CRYPTOQUANT_BASE_DIR", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+logger = logging.getLogger("cryptoquant.cognition")
+
+# 【P1-21 修复】持久化根必须与 memory.py / reflection.py 一致（二者用 2 层 dirname
+# 落在 cryptoquant_auto/）。旧版用 3 层 dirname 落在仓库根，导致 env_history.json
+# 与 finmem/reflection 数据分处两目录、跨模块读取互不可见。统一为包目录。
+BASE_DIR = os.environ.get("CRYPTOQUANT_BASE_DIR",
+                          os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ENV_HIST_FILE = os.path.join(BASE_DIR, "data", "env_history.json")
 
 
@@ -108,8 +115,8 @@ def record_env(rec: EnvRecord) -> None:
         hist = hist[-5000:]
         with open(ENV_HIST_FILE, "w") as f:
             json.dump(hist, f)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("env_history 持久化失败（跳过，不影响本次评估）：%s", e)
 
 
 def load_env_history() -> List[dict]:
@@ -117,6 +124,6 @@ def load_env_history() -> List[dict]:
         if os.path.exists(ENV_HIST_FILE):
             with open(ENV_HIST_FILE) as f:
                 return json.load(f)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("env_history 读取失败（返回空）：%s", e)
     return []

@@ -16,6 +16,11 @@ import numpy as np
 from .backtest import PaperBacktest, BacktestConfig, make_random_signals
 from ..risk.kelly import KellyConfig, fractional_kelly, kelly_nominal
 
+# 【P1-27 修复】回测每步 = 1h bar，年化周期数应为 365*24=8760，而非日线的 252。
+# 旧版用 sqrt(252) 会把 WF 的 DSR 与 metrics.deflated_sharpe（默认 8760）置于不同
+# 年化尺度，导致同口径指标不可比、且 DSR 被系统性低估。统一为 1h 口径。
+PERIODS_PER_YEAR_1H = 8760
+
 
 @dataclass
 class WFReport:
@@ -50,7 +55,7 @@ def _deflated_sharpe(returns: np.ndarray, sr0: float = 0.0) -> float:
     std = returns.std(ddof=1)
     if std == 0:
         return 0.0
-    sr = mean / std * math.sqrt(252)
+    sr = mean / std * math.sqrt(PERIODS_PER_YEAR_1H)
     # 偏度/峰度
     skew = float(np.mean(((returns - mean) / std) ** 3))
     kurt = float(np.mean(((returns - mean) / std) ** 4))
@@ -92,7 +97,8 @@ def estimate_pb(trades: list) -> Tuple[float, float]:
 
 
 def walk_forward(signals: list, windows: int = 6, is_ratio: float = 0.6,
-                 seed: int = 7, embargo: float = 0.0, purge: float = 0.0) -> WFReport:
+                 seed: int = 7, embargo: float = 0.0, purge: float = 0.0,
+                 min_iso_bars: int = 1) -> WFReport:
     """滚动 Walk-Forward（IS/OOS）过拟合护栏。
 
     阶段0.5 新增 embargo / purge 防泄漏间隔（Lopez de Prado）：
@@ -101,6 +107,10 @@ def walk_forward(signals: list, windows: int = 6, is_ratio: float = 0.6,
       - embargo: 丢弃测试段开头 `embargo*OOS长度` 根 K（与训练段相邻，
                  标签/特征跨窗重叠）—— 净化测试集。
     默认 embargo=purge=0 时退化为原朴素 WF（向后兼容）。
+
+    【P1-15 修复】隔离条数按 `int(frac*窗口长)` 计算，小窗口下会整除下取整为 0，
+    导致 embargo/purge>0 却「无隔离」（泄漏护栏悄悄失效）。新增 min_iso_bars：
+    只要 frac>0，隔离条数至少取 min_iso_bars，确保防泄漏层真正生效。
     """
     rep = WFReport()
     n = len(signals)
@@ -117,8 +127,9 @@ def walk_forward(signals: list, windows: int = 6, is_ratio: float = 0.6,
         if te_end <= te_start:
             continue
         # ---- 阶段0.5：Purged + Embargo 间隔（防 IS/OOS 信息泄漏）----
-        purge_bars = int(purge * max(0, is_end - start))
-        embargo_bars = int(embargo * max(0, te_end - te_start))
+        # 【P1-15】frac>0 时按 min_iso_bars 兜底，避免整除下取整为 0 使隔离失效。
+        purge_bars = int(purge * max(0, is_end - start)) or (min_iso_bars if purge > 0 else 0)
+        embargo_bars = int(embargo * max(0, te_end - te_start)) or (min_iso_bars if embargo > 0 else 0)
         train = signals[start: max(start, is_end - purge_bars)]   # 训练段去尾
         test = signals[te_start + embargo_bars: te_end]            # 测试段去头
         rep.n_purged_bars += purge_bars
@@ -145,7 +156,7 @@ def walk_forward(signals: list, windows: int = 6, is_ratio: float = 0.6,
         if len(eq) > 2:
             rets = eq[1:] / eq[:-1] - 1.0
             oos_returns.append(rets)
-            rep.oos_sharpes.append(float(np.mean(rets) / np.std(rets, ddof=1) * math.sqrt(252)) if np.std(rets, ddof=1) > 0 else 0.0)
+            rep.oos_sharpes.append(float(np.mean(rets) / np.std(rets, ddof=1) * math.sqrt(PERIODS_PER_YEAR_1H)) if np.std(rets, ddof=1) > 0 else 0.0)
         rep.oos_win_rate = rep.oos_profit_wins / max(1, windows)
     # 【C7 修复 · 2026-07-12】DSR/PBO 统计前提修正
     # 原实现把各 fold 的 equity_curve 直接 concat 算 DSR —— fold 间已归零/不连续，

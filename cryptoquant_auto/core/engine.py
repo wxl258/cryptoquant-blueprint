@@ -63,6 +63,10 @@ class ExecutionEngine:
         self._realized: float = 0.0                  # 累计已实现权益（含杠杆名义盈亏）
         self._peak_equity: float = self._equity_base
         self._loss_streak: int = 0
+        # 【P1-9 修复】日间盈亏与日界键：daily_pnl 必须按自然日重置，否则全程累计
+        # 会让长期微亏误触 L2(-0.05)，阈值基准错误。
+        self._realized_day: float = 0.0
+        self._day_key: Optional[str] = None
         self._win_streak: int = 0
         self._price_buf: list = []                    # 【C8】近期价格缓冲，估 ATR sigma 兜底
 
@@ -143,6 +147,11 @@ class ExecutionEngine:
     def _submit_signal(self, sig: Signal, snapshot: MarketSnapshot = None,
                        ev_est: Optional[float] = None, now: float = None,
                        kc: "KellyConfig" = None) -> Decision:
+        # 【P0-1 修复】R0 宪法硬锁下沉到执行入口：此前 constitution.check 仅由
+        # ingest_meta 调用，v8 ingest_signal 直连路径（→本方法）完全绕开 → 硬锁形同虚设。
+        # 现于所有下单路径的统一入口强制否决，覆盖 ingest_signal / ingest_meta 两条链路。
+        if self.constitution is not None and self.constitution.live_capital:
+            return Decision(reject="R0:live_capital=True 禁止任何实盘动作（原型仅沙盒）")
         if now is not None:
             self._now = now                            # P0-3: 推进时钟
         self.cb.feed_signal(self._now)                  # 信号源活跃，刷新熔断 stall
@@ -204,6 +213,7 @@ class ExecutionEngine:
         # 回测不传 now 时保持 _now 不变，避免按 bar 步进触发 stall 误熔断（不回归）。
         if now is not None:
             self._now = now
+            self._rollover_day()                         # 【P1-9】日界检测→重置日间盈亏
             self.cb.check_stall(self._now)              # 信号源中断熔断
             if self.cb.tripped:
                 return StepReport(events=[f"circuit_trip:{self.cb.reason}"])
@@ -256,6 +266,16 @@ class ExecutionEngine:
         report.reconcile = reconcile(list(self.expected.values()), self.adapter.query_positions())
         return report
 
+    def _rollover_day(self) -> None:
+        """【P1-9】按自然日重置日间盈亏：daily_pnl 必须基于当日盈亏而非全程累计。"""
+        import datetime as _dt
+        key = _dt.datetime.utcfromtimestamp(self._now).strftime("%Y-%m-%d")
+        if self._day_key is None:
+            self._day_key = key
+        elif key != self._day_key:
+            self._day_key = key
+            self._realized_day = 0.0
+
     def _feed_kill_switch(self, report: StepReport, anomaly: dict = None) -> None:
         """用引擎自维护的权益/连亏/保证金度量刷新 KillSwitch（P0-2 修复核心）。
 
@@ -264,7 +284,8 @@ class ExecutionEngine:
         """
         peak_dd = (self._peak_equity - self._equity_base) / self._equity_base
         peak_dd = min(0.0, peak_dd)
-        daily_pnl = self._realized / self._equity_base
+        # 【P1-9】daily_pnl 用「当日」盈亏，而非全程累计（_realized_day 在日界重置）
+        daily_pnl = self._realized_day / self._equity_base
         # 保证金率：适配器暴露则用之，否则维持安全默认（不谎报风险）
         margin_ratio = getattr(self.adapter, "margin_ratio", 99.0)
         # 异动值：优先用上层显式传入，否则用价格缓冲估算 ATR sigma
@@ -350,6 +371,7 @@ class ExecutionEngine:
             sign = 1 if pos.direction is Direction.LONG else -1
             pnl_frac = (f.price - pos.entry_price) * f.qty * sign / max(self._equity_base, 1.0)
             self._realized += pnl_frac
+            self._realized_day += pnl_frac          # 【P1-9】同步累计日间盈亏
             self._peak_equity = max(self._peak_equity, self._equity_base + self._realized)
             if pnl_frac < 0:
                 self._loss_streak += 1
@@ -378,5 +400,17 @@ class ExecutionEngine:
         )
 
     def manual_resume(self) -> None:
-        """Fail-closed：人工 ACK 恢复。"""
+        """Fail-closed：人工 ACK 恢复。
+
+        【P1-6 修复】除 KillSwitch 自身复位外，必须同步清零引擎侧累计权益度量
+        （_realized / _peak_equity / _loss_streak / _realized_day），否则下一轮
+        _feed_kill_switch 仍以「累计亏损」重判 daily_pnl/peak_dd → 立刻重新跳闸 L1/L2，
+        人工 ACK 形同虚设。
+        """
         self.ks.manual_resume()
+        self._realized = 0.0
+        self._peak_equity = self._equity_base
+        self._loss_streak = 0
+        self._win_streak = 0
+        self._realized_day = 0.0
+        self._day_key = None

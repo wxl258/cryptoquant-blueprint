@@ -28,8 +28,8 @@ class FallbackRouter(ExchangeAdapter):
                     last_err = f"reject@{venue}"
                     continue
                 return o
-            except (TimeoutError, ConnectionError, OSError) as e:
-                last_err = f"transient@{venue}:{e}"
+            except Exception as e:   # 【P1 修复】兜底所有异常→降级 REJECTED（fail-safe，非 fail-open）
+                last_err = f"transient@{venue}:{e!r}"
                 continue
         # 全部失败：返回 REJECTED 占位（真实环境应告警断路）
         order.status = OrderStatus.REJECTED

@@ -58,19 +58,23 @@ class KillSwitch:
         # L3 最高优先（生存态）
         if self.margin_ratio < 1.3 or self.black_swan:
             self.level = KillLevel.L3_SURVIVE
+            self.ack_required = True      # 【P1-5】升级即要求人工 ACK，fail-closed
             return
         # L2
         if self.daily_pnl <= -0.05 or self.peak_dd <= -0.10 or self.loss_streak >= 5:
             self.level = KillLevel.L2_REDUCE
+            self.ack_required = True
             return
         # L1
         if (self.daily_pnl <= -0.03 or self.peak_dd <= -0.05 or self.loss_streak >= 3
                 or self.btc_vol_sigma > 2.5 or self.api_fail_rate > 0.10):
             self.level = KillLevel.L1_PAUSE_NEW
+            self.ack_required = True
             return
         # 共识#10 事后触发器：OI/资金费/ATR 异动即暂停新开，不幻想事前逃顶
         if self.oi_spike_pct > 0.10 or self.fr_spike > 0.001 or self.atr_sigma_spike > 3.0:
             self.level = KillLevel.L1_PAUSE_NEW
+            self.ack_required = True
             return
         self.level = KillLevel.NORMAL
 

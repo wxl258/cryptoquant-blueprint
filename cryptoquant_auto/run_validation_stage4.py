@@ -298,8 +298,11 @@ def main() -> int:
     N = max(1, len(tsfm_sigs))
     ab = controlled_ab(flat_base, flat_tsfm, n_trials=N, sr0=0.0,
                        alpha=0.05, periods_per_year=1)
-    print(f"   动量基线 DSR(N={N})={dsr_base:.3f} 盈利窗={wr_b:.0%} 剪bar purge={pbb} embargo={ebb}")
-    print(f"   TSFM    DSR(N={N})={dsr_tsfm:.3f} 盈利窗={wr_t:.0%} 剪bar purge={pbt} embargo={ebt}")
+    # 【P1-14/quant 修复】_real_forward_wf 用 deflated_sharpe(n_trials=1) 逐 fold 聚合，
+    # n_trials=1 时 DSR 退化为 PSR——此处原标签误标为 "DSR"。真实 DSR 闸门是 controlled_ab
+    # （n_trials=N 多重检验校正，见下方 p 值）。这里如实标注为 PSR。
+    print(f"   动量基线 PSR(N={N})={dsr_base:.3f} 盈利窗={wr_b:.0%} 剪bar purge={pbb} embargo={ebb}")
+    print(f"   TSFM    PSR(N={N})={dsr_tsfm:.3f} 盈利窗={wr_t:.0%} 剪bar purge={pbt} embargo={ebt}")
     print(f"   ΔDSR={dsr_tsfm-dsr_base:+.3f}  p={ab.p_value:.4f} 显著={ab.significant} 胜方={ab.winner}")
     recommend = (dsr_tsfm > dsr_base) and ab.significant and dsr_tsfm > 0 and dsr_base > 0
     print(f"   → {'✅TSFM 显著优于基线' if recommend else '🔒未证明更优（诚实，不伪造 edge）'}")
@@ -315,7 +318,7 @@ def main() -> int:
         if key in ("dsr_base", "dsr_tsfm", "recommend_tsfm"):
             continue
         print(f"  {'✅' if ok else '❌'} {key}")
-    print(f"\n  DSR 实测: 动量基线={results.get('dsr_base',0):.3f}  TSFM={results.get('dsr_tsfm',0):.3f}")
+    print(f"\n  PSR 实测(逐fold聚合, n_trials=1): 动量基线={results.get('dsr_base',0):.3f}  TSFM={results.get('dsr_tsfm',0):.3f}")
     all_ok = all(v for k, v in results.items()
                  if k not in ("dsr_base", "dsr_tsfm", "recommend_tsfm"))
     print("\n" + ("✅ 阶段4 四任务全部落地（TSFM 骨架 + CVaR 约束 + StockSim LLM 市场），"

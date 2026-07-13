@@ -47,6 +47,12 @@ class LLMDecision:
     source_regimes: List[str] = field(default_factory=list)
     retrieved_insights: List[str] = field(default_factory=list)
 
+    # 【P1-14 修复】schema 校验强制化：任何构造（含 LLM/反序列化）都必经校验，
+    # 不再依赖调用方手动 produce() 才触发——杜绝绕过校验的脏数据进入风控。
+    def __post_init__(self) -> "LLMDecision":
+        self.validate()
+        return self
+
     # ---- 严格 schema 校验（零依赖，等价于 pydantic model_validator）----
     def validate(self) -> "LLMDecision":
         if self.market_state not in MARKET_STATES:

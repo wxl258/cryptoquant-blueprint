@@ -44,7 +44,10 @@ def cvar_sharpe_score(returns: np.ndarray, alpha: float = 0.05,
         return sr
     cv = cvar(r, alpha)
     breach = max(0.0, cvar_budget - cv)     # cv 更负 → breach>0
-    return sr - penalty * (breach / abs(cvar_budget + 1e-12))
+    # 【P1-13/quant 修复】分母用 abs(cvar_budget)，但 cvar_budget 接近 0 时会除以极小值
+    # 致惩罚项爆炸（数值不稳定）。用下限 1e-3 兜底，保证惩罚有界且单调。
+    denom = max(abs(cvar_budget), 1e-3)
+    return sr - penalty * (breach / denom)
 
 
 class VanillaTrader:

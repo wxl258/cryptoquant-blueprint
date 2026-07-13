@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import tempfile
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -180,7 +181,9 @@ def main() -> int:
     results["stage0_5_reconfirm"] = iso_active and dsr_mono and spi_ok and ab_runs
 
     # ---- 共享记忆（③ 与 ⑤ 复用，体现反思自改进喂给 A/B）----
-    mem = FinMemMemory()
+    # 【P2 修复】隔离到临时目录，避免加载被污染/跨运行共享的持久化记忆
+    # （默认 data/ 会累积历史 episode + stale forbidden_at，破坏验证确定性）。
+    mem = FinMemMemory(base_dir=tempfile.mkdtemp(prefix="cq_stage3_"))
     council = FourRoleCouncil(mem, MockLLM())
 
     # ---- ③ FinMem 记忆闭环（任务16）----

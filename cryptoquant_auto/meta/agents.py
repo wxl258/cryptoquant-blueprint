@@ -160,16 +160,20 @@ class DecisionMaker:
 class RiskController:
     """宪法式硬锁：禁易 regime / 置信钳制 / 高不确定转 HOLD。"""
 
-    def guard(self, dec: LLMDecision, profile, spi_surprise: float = 0.0
-              ) -> (str, List[str]):
+    def guard(self, dec: LLMDecision, profile, spi_surprise: float = 0.0,
+              regime: Optional[str] = None) -> (str, List[str], float):
         vetoes: List[str] = []
         action = dec.proposed_action
         conf = dec.confidence
 
-        # 禁易 regime（反思自改进写入 Profile）
-        if dec.market_state in profile.forbidden_regimes:
+        # 禁易 regime（反思自改进写入 Profile）。【P0-3 修复】统一命名空间：
+        # reflect() 把禁易键存为原始 regime（如 "TREND"），而本方法旧版只比对
+        # dec.market_state（BULL/BEAR/RANGE/CRASH）→ "TREND" 永不等于任何 market_state，
+        # 禁易锁对非 CRASH 永不触发（仅在 CRASH 巧合生效）。现同时比对原始 regime。
+        if (dec.market_state in profile.forbidden_regimes
+                or (regime is not None and regime in profile.forbidden_regimes)):
             action = HOLD
-            vetoes.append(f"forbidden_regime:{dec.market_state}")
+            vetoes.append(f"forbidden_regime:{dec.market_state}/{regime}")
         # 置信低于最小信念 → 软降级 HOLD
         if conf < profile.min_conviction:
             if action != HOLD:
@@ -196,6 +200,7 @@ class CouncilVerdict:
     vetoes: List[str]
     llm_decision: Dict
     analyst_drivers: List[str]
+    decision_id: str = ""            # 【P0-4】关联短期记忆 Episode，供 set_outcome 精确回填
 
     def direction_int(self) -> int:
         return 1 if self.action == LONG else (-1 if self.action == SHORT else 0)
@@ -224,14 +229,27 @@ class FourRoleCouncil:
         self.decider = DecisionMaker(self.llm)
 
     def decide(self, symbol: str, feat: np.ndarray, regime: str,
-               spi_surprise: float = 0.0, record: bool = True
-               ) -> CouncilVerdict:
+               spi_surprise: float = 0.0, record: bool = True,
+               conformal=None) -> CouncilVerdict:
         a = self.analyst.assess(symbol, feat, regime, self.profile)
         r = self.researcher.debate(symbol, feat, regime, a, self.memory)
         dec = self.decider.propose(symbol, feat, regime, a, r, self.memory,
                                     spi_surprise=spi_surprise)
+        # 初筛：先以 spi=0 跑一次风控门，得到本轮置信（供 conformal 评估）
         action, vetoes, conf = RiskController().guard(
-            dec, self.profile, spi_surprise=spi_surprise)
+            dec, self.profile, spi_surprise=0.0, regime=regime)
+        # 【P1-10 修复】SPCI 在线惊喜度：用跨 tick 历史置信分布自适应评估
+        # 「本轮置信是否异常」。先以 prior 窗口算惊喜度（留一，避免自污染），
+        # 再喂入本轮 score 供下轮使用；最后用真实 spi 重跑风控门使软降级生效。
+        spi = spi_surprise
+        if conformal is not None:
+            score = 1.0 - float(conf)
+            if conformal.n_samples >= 5:
+                spi = float(conformal.surprise(score))
+            conformal.update(score)
+            if spi != 0.0:
+                action, vetoes, conf = RiskController().guard(
+                    dec, self.profile, spi_surprise=spi, regime=regime)
 
         verdict = CouncilVerdict(
             symbol=symbol, regime=regime,
@@ -241,10 +259,11 @@ class FourRoleCouncil:
             analyst_drivers=a["drivers"],
         )
         if record:
-            # 写盘情景记忆（待平仓后 set_outcome 回填）
-            self.memory.record_decision(Episode(
+            # 写盘情景记忆（待平仓后 set_outcome 精确回填）；返回 decision_id 供上层关联
+            did = self.memory.record_decision(Episode(
                 ts=time.time(), symbol=symbol, regime=regime,
                 decision=action, confidence=conf,
                 rationale=verdict.rationale,
             ))
+            verdict.decision_id = did
         return verdict

@@ -16,11 +16,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+logger = logging.getLogger("cryptoquant.reflection")
 
 # 持久化路径（与 cognition.py 的 env_history.json 同目录）
 _BASE_DIR = os.environ.get("CRYPTOQUANT_BASE_DIR",
@@ -63,7 +65,8 @@ class ReflectionLog:
             if os.path.exists(self.path):
                 with open(self.path) as f:
                     self.records = json.load(f)
-        except Exception:
+        except Exception as e:
+            logger.warning("reflection_log 读取失败（返回空）：%s", e)
             self.records = []
 
     def _save(self) -> None:
@@ -71,8 +74,8 @@ class ReflectionLog:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(self.path, "w") as f:
                 json.dump(self.records[-100:], f, indent=2)  # 保留最近 100 条
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("reflection_log 持久化失败（跳过）：%s", e)
 
     def record(self, *, timestamp: float = None,
                fold_weights: list = None,

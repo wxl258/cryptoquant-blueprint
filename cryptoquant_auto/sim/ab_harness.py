@@ -66,22 +66,54 @@ def _betai(a: float, b: float, x: float) -> float:
     return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
 
 
+def _lag1_acf(x: np.ndarray) -> float:
+    """lag-1 自相关（时序非 iid 的代理）。"""
+    x = np.asarray(x, float)
+    if len(x) < 3:
+        return 0.0
+    x = x - x.mean()
+    if x.std() < 1e-12:
+        return 0.0
+    return float(np.corrcoef(x[:-1], x[1:])[0, 1])
+
+
+def _eff_n(n: int, rho: float) -> float:
+    """自相关下的有效样本量：方差膨胀因子 (1+ρ)/(1-ρ) 的倒数。
+
+    ρ→±1 时退化为保守保护值，避免除零/极端自由度。
+    """
+    if abs(rho) >= 0.999:
+        return max(2.0, n / 10.0)
+    return max(2.0, n * (1.0 - rho) / (1.0 + rho))
+
+
 def _welch_p(a: np.ndarray, b: np.ndarray) -> float:
-    """Welch 两样本 t 检验双侧 p 值（正确 t 分布）。"""
+    """Welch 两样本 t 检验双侧 p 值（正确 t 分布）。
+
+    【P1-16 修复】金融收益序列**非 iid**（自相关），朴素 Welch 把有效样本量当成
+    名义 n，使 p 值被系统性低估（假显著、易误放行）。用 lag-1 自相关做 Newey-West
+    风格修正：方差按 (1+ρ)/(1-ρ) 膨胀、自由度用有效样本量；iid 输入(ρ≈0)则与原值一致。
+    """
     a = np.asarray(a, float); b = np.asarray(b, float)
     na, nb = len(a), len(b)
     if na < 2 or nb < 2:
         return 1.0
     va = a.var(ddof=1); vb = b.var(ddof=1)
     ma = a.mean(); mb = b.mean()
+    rho_a, rho_b = _lag1_acf(a), _lag1_acf(b)
+    if abs(rho_a) < 0.999:
+        va *= (1.0 + rho_a) / (1.0 - rho_a)
+    if abs(rho_b) < 0.999:
+        vb *= (1.0 + rho_b) / (1.0 - rho_b)
     se = math.sqrt(va / na + vb / nb)
     if se == 0:
         return 1.0
     t = (ma - mb) / se
+    na_eff, nb_eff = _eff_n(na, rho_a), _eff_n(nb, rho_b)
     df_num = (va / na + vb / nb) ** 2
-    df_den = (va / na) ** 2 / (na - 1) + (vb / nb) ** 2 / (nb - 1)
-    df = df_num / df_den if df_den > 0 else (na + nb - 2)
-    df = max(1.0, min(df, na + nb - 2))
+    df_den = (va / na) ** 2 / (na_eff - 1) + (vb / nb) ** 2 / (nb_eff - 1)
+    df = df_num / df_den if df_den > 0 else (na_eff + nb_eff - 2)
+    df = max(1.0, min(df, na_eff + nb_eff - 2))
     x = df / (df + t * t)
     p_one = 0.5 * _betai(df / 2.0, 0.5, x)
     return float(min(1.0, 2.0 * p_one))

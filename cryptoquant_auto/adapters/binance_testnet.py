@@ -21,7 +21,21 @@ BASE = "https://testnet.binancefuture.com"
 
 class BinanceTestnetAdapter(ExchangeAdapter):
     def __init__(self, api_key: str, api_secret: str, recv_window: int = 5000,
-                 timeout: float = 10.0):
+                 timeout: float = 10.0, constitution=None):
+        # 【P0-2 修复】注入宪法，使适配器级兜底实盘硬锁：即便引擎层被绕过，
+        # 只要 constitution.live_capital=True 就拒绝任何真实下单。否则改 BASE 为主网
+        # + 接 Key 即可直触真钱，原硬锁仅存在于 run_validation 的 assert（非执行入口）。
+        # 另：若 BASE 指向主网（非 testnet）则架构级拒绝构建，杜绝一念之差触真钱。
+        if constitution is None:
+            from ..risk.constitution import TradingConstitution
+            constitution = TradingConstitution(live_capital=False)
+        if "testnet" not in BASE:
+            raise RuntimeError(
+                "BinanceTestnetAdapter 拒绝接入主网 BASE；原型仅允许 testnet 假钱")
+        if constitution.live_capital:
+            raise RuntimeError(
+                "constitution.live_capital=True：架构级禁止任何实盘动作（原型仅沙盒）")
+        self.constitution = constitution
         self.key = api_key
         self.sec = api_secret
         self.recv = recv_window
@@ -47,6 +61,10 @@ class BinanceTestnetAdapter(ExchangeAdapter):
 
     # ---- 下单 ----
     def submit(self, order: Order) -> Order:
+        # 【P0-2 修复】适配器级实盘硬锁兜底：即便引擎层被绕过，live_capital=True 也拒绝下单。
+        if self.constitution.live_capital:
+            order.status = OrderStatus.REJECTED
+            return order
         params = {"symbol": self._sym(order.symbol), "side": order.side,
                   "quantity": round(order.qty, 6)}
         if order.otype is OrderType.ENTRY:
@@ -58,6 +76,13 @@ class BinanceTestnetAdapter(ExchangeAdapter):
         elif order.otype is OrderType.SL:
             params.update(type="STOP", stopPrice=str(order.price),
                           price=str(order.price), timeInForce="GTC")
+        elif order.otype is OrderType.REDUCE:
+            # 【P1-8 修复】L3 生存态减仓单：市价减仓（不挂限价，确保生存态能真正减仓）。
+            # 原实现缺此分支 → REDUCE 无 type/price → 真实路径拒单/异常，减仓失效。
+            params.update(type="MARKET",
+                          reduceOnly=True,
+                          closePosition=False)
+            params.pop("price", None)
         params["newClientOrderId"] = order.coid
         try:
             r = self.sess.post(BASE + "/fapi/v1/order", params=self._sign(params),

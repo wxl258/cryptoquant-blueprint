@@ -19,14 +19,21 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import logging
 import os
+import sys
 import time
 import urllib.request
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import numpy as np
+
+from .util.logging_setup import setup_logging
+
+logger = logging.getLogger("cryptoquant")
 
 # ---- 硬锁：纸面原型的唯一合法值（置 True 即启动即退）----
 LIVE_CAPITAL = False
@@ -38,11 +45,17 @@ from .meta.agents import FourRoleCouncil, LONG, SHORT, HOLD
 from .meta.memory import FinMemMemory
 from .adapters.real_llm import get_llm, RealLLM
 from .risk.constitution import TradingConstitution
+from .risk.conformal import SequentialConformalPredictor
 from .risk.regime import detect_regime
 
 ACTION_TO_INT = {"LONG": 0, "SHORT": 1, "HOLD": 2}
 
 PAPER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "paper")
+
+# 【P1-29 修复】cron/守护并发锁：paper 输出（dashboard/journal/state）为全局文件，
+# 若 cron 间隔小于单次耗时，多进程并发写入会互相覆盖/截断。用 fcntl 全局排他锁，
+# 已有实例运行时后续实例直接退出，保证单写者（fail-closed 而非竞态损坏）。
+_PAPER_LOCK = os.path.join(PAPER_DIR, ".paper_runner.lock")
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +197,7 @@ class GateioPublicDataSource(DataSource):
                     "ts": int(k1h[i]["t"]),
                 }
             except Exception as e:
-                print(f"  [warn] {s} 拉取失败: {e}")
+                logger.warning("[gateio] %s 拉取失败: %s", s, e)
                 continue
         return out
 
@@ -209,21 +222,28 @@ class RunResult:
 
 
 def run_once(source: DataSource, council: FourRoleCouncil,
-             constitution: TradingConstitution, memory: FinMemMemory) -> List[dict]:
+             constitution: TradingConstitution, memory: FinMemMemory,
+             conformal=None) -> List[dict]:
     snap = source.snapshot()
     llm_is_real = isinstance(council.llm, RealLLM)
+    # 【P1-10 修复】conformal 由 main() 实例化并跨 tick 持有；decide() 内部完成
+    # 惊喜度计算与风控门软降级（详见 agents.FourRoleCouncil.decide）。
     records: List[dict] = []
     for sym, d in snap.items():
         verdict = council.decide(
-            sym, d["feat"], d["regime"], spi_surprise=0.0, record=True)
+            sym, d["feat"], d["regime"], record=True, conformal=conformal)
         action_int = ACTION_TO_INT.get(verdict.action, 2)
         const = constitution.check(
             _PaperDecision(action_int, " ".join(verdict.rationale), verdict.confidence))
+        final_action = verdict.action
+        # 【P1-11 修复】宪法否决（含 R0 硬锁）→ 以 safe_action 覆盖，不得照常输出违规动作
+        if not const.compliant:
+            final_action = "HOLD"   # 宪法 safe_action 恒为"观望"
         rec = {
             "symbol": sym,
             "regime": d["regime"],
             "market_state": verdict.market_state,
-            "action": verdict.action,
+            "action": final_action,
             "confidence": round(verdict.confidence, 4),
             "rationale": verdict.rationale,
             "vetoes": verdict.vetoes,
@@ -272,35 +292,56 @@ def _write_dashboard(records: List[dict]) -> None:
 
 
 def main() -> int:
-    # ---- 架构级硬锁：纸面原型绝不允许 live_capital=True ----
-    if LIVE_CAPITAL:
-        print("🛑 LIVE_CAPITAL=True 被检测到：纸面原型禁止触碰实盘，启动即退出。")
-        return 2
-
+    # ---- 解析参数（须先于 logging 配置，以便 --log-file 生效）----
     ap = argparse.ArgumentParser(description="CryptoQuant 纸面模拟运行器（只模拟不下单）")
     ap.add_argument("--once", action="store_true", help="单次运行（默认）")
     ap.add_argument("--loop", action="store_true", help="持续运行（守护/cron）")
     ap.add_argument("--interval", type=int, default=300, help="循环间隔秒（默认 300）")
     ap.add_argument("--source", choices=["history", "gateio"], default="history",
                     help="数据源：history 回放（默认） / gateio 只读实时")
+    ap.add_argument("--log-file", default=None,
+                    help="日志落盘路径（守护/生产建议指定，启用 RotatingFileHandler 轮转）")
     args = ap.parse_args()
+
+    # 【P2-B】结构化日志：所有诊断走 logging，避免散落 print 到 stderr；
+    # 传 --log-file 即落盘（轮转），便于生产服务器持久化与接 CLS。
+    # setup_logging 幂等，重复调用不叠加。
+    setup_logging(log_file=args.log_file)
+
+    # ---- 架构级硬锁：纸面原型绝不允许 live_capital=True ----
+    if LIVE_CAPITAL:
+        logger.error("🛑 LIVE_CAPITAL=True 被检测到：纸面原型禁止触碰实盘，启动即退出。")
+        return 2
+
+    # ---- 【P1-29】cron 并发排他锁 ----
+    os.makedirs(PAPER_DIR, exist_ok=True)
+    lock_fd = open(_PAPER_LOCK, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.warning("⏳ 已有 paper_runner 实例运行（cron 排他锁占用），本次退出避免并发写冲突。")
+        lock_fd.close()
+        return 0
 
     source = GateioPublicDataSource() if args.source == "gateio" else HistoryDataSource()
     memory = FinMemMemory()
     council = FourRoleCouncil(memory, llm=get_llm())
     constitution = TradingConstitution(live_capital=LIVE_CAPITAL)
+    # 【P1-10】SPCI 在线预测器：跨 tick 持有，喂入历史置信分布，产出惊喜度。
+    conformal = SequentialConformalPredictor(alpha=0.10)
 
-    print(f"🧪 纸面模拟启动 | 数据源={args.source} | LLM={'真' if isinstance(council.llm, RealLLM) else 'mock'}"
-          f" | 硬锁 live_capital={LIVE_CAPITAL}（仅模拟）")
-    print(f"   覆盖币种：{', '.join(source.symbols())}")
+    logger.info("🧪 纸面模拟启动 | 数据源=%s | LLM=%s | 硬锁 live_capital=%s（仅模拟）",
+                args.source, "真" if isinstance(council.llm, RealLLM) else "mock", LIVE_CAPITAL)
+    logger.info("   覆盖币种：%s", ", ".join(source.symbols()))
 
     def tick():
-        recs = run_once(source, council, constitution, memory)
-        print(f"   本轮 {len(recs)} 个决策 → paper/paper_dashboard.md 已更新")
+        recs = run_once(source, council, constitution, memory, conformal=conformal)
+        logger.info("   本轮 %d 个决策 → paper/paper_dashboard.md 已更新", len(recs))
         for r in recs:
             if r["action"] != "HOLD":
-                print(f"     · {r['symbol']} {r['action']} conf={r['confidence']:.2f} "
-                      f"合规={'✅' if r['constitution_compliant'] else '❌'}")
+                logger.info("     · %s %s conf=%.2f 合规=%s",
+                            r["symbol"], r["action"], r["confidence"],
+                            "✅" if r["constitution_compliant"] else "❌")
 
     if args.loop:
         try:
@@ -308,7 +349,7 @@ def main() -> int:
                 tick()
                 time.sleep(args.interval)
         except KeyboardInterrupt:
-            print("\n🛑 已停止（纸面模拟，无未平仓/无下单）")
+            logger.info("\n🛑 已停止（纸面模拟，无未平仓/无下单）")
     else:
         tick()
     return 0

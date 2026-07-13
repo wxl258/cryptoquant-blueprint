@@ -1,0 +1,41 @@
+# CryptoQuant 蓝图原型 · CI 回归守门
+#
+# 作用：每次 push / PR 自动跑全套回归，任一 ❌ 即失败、拦住合并/部署。
+# 触发：推到 GitHub 后由 GitHub 免费 runner 自动执行（无需自备服务器）。
+# 本地加好此文件、随代码一起 commit，推送即生效；推送前完全惰性。
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install --upgrade pip pytest numpy
+
+      - name: Pytest suite (63 项)
+        run: python -m pytest tests/ -q
+
+      - name: P1 fix verification (12 项)
+        run: python verify_p1_fixes.py
+
+      - name: Validation stage4
+        run: python -m cryptoquant_auto.run_validation_stage4
+
+      - name: Validation stage3
+        run: python -m cryptoquant_auto.run_validation_stage3
+
+      - name: Validation stage0.5
+        run: python -m cryptoquant_auto.run_validation_0_5

@@ -1,0 +1,30 @@
+[Unit]
+Description=CryptoQuant 纸面模拟运行器（零资金/零密钥，fail-closed）
+Documentation=file:///opt/cryptoquant/cryptoquant-blueprint/deploy/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ===== 部署时按你的服务器修改（以下为示例）=====
+User=cryptoquant
+Group=cryptoquant
+WorkingDirectory=/opt/cryptoquant/cryptoquant-blueprint
+Environment=PYTHONPATH=/opt/cryptoquant/cryptoquant-blueprint
+# 纸面原型硬约束：绝不允许触碰实盘（宪法 R0；LIVE_CAPITAL=True 即启动即退）
+Environment=LIVE_CAPITAL=False
+# 可选覆盖（如需与默认不同）：
+# Environment=CRYPTOQUANT_LOG_DIR=/var/log/cryptoquant
+# Environment=CRYPTOQUANT_INTERVAL=300
+# Environment=CRYPTOQUANT_SOURCE=history
+# =============================================
+# 运行前确保日志目录归属正确（避免 PermissionError 落盘失败）
+ExecStartPre=/usr/bin/install -d -o cryptoquant -g cryptoquant /var/log/cryptoquant
+ExecStart=/opt/cryptoquant/cryptoquant-blueprint/deploy/start.sh
+Restart=always
+RestartSec=10
+# 原型无外部副作用，仍收紧提权；如需更严沙箱可加 ProtectSystem=strict 等
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

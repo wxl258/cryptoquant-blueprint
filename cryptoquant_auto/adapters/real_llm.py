@@ -16,12 +16,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Optional
 
 from .mock_llm import (
     LLMDecision, CouncilContext, tool_spec, MockLLM, SchemaValidationError,
 )
+
+logger = logging.getLogger("cryptoquant.real_llm")
 
 
 class RealLLM:
@@ -45,15 +48,21 @@ class RealLLM:
         self._degrade = degrade_on_error
         self._client = OpenAI(api_key=key, base_url=base_url,
                               timeout=timeout, max_retries=max_retries)
+        # 【P1-13 修复】降级可观测：记录最近一次降级原因，避免「静默降级」让运维误以为真 LLM 在线。
+        self.degraded = False
+        self.last_error: Optional[BaseException] = None
 
     # ---- 对外统一接口（与 MockLLM 一致）----
     def produce(self, ctx: CouncilContext) -> LLMDecision:
         try:
             return self._call(ctx)
-        except Exception:
+        except Exception as e:
             if not self._degrade:
                 raise
             # fail-closed：降级为确定性接地 mock，保证管线不中断
+            self.degraded = True
+            self.last_error = e
+            logger.warning("RealLLM 调用失败，已降级 MockLLM（fail-closed）：%s", e)
             return MockLLM().produce(ctx)
 
     def complete(self, ctx: CouncilContext) -> LLMDecision:
@@ -108,5 +117,6 @@ def get_llm(degrade_on_error: bool = True):
         if not os.getenv("CRYPTOQUANT_LLM_KEY"):
             return MockLLM()
         return RealLLM(degrade_on_error=degrade_on_error)
-    except Exception:
+    except Exception as e:
+        logger.warning("RealLLM 初始化失败，回退 MockLLM：%s", e)
         return MockLLM()

@@ -245,13 +245,12 @@ class LLMMarketAgent(MockMarketAgent):
         self._sentiment = 0.0
         self._conf = 0.0
         self.last_narrative = ""
-        try:
-            from ..adapters.mock_llm import MockLLM, CouncilContext
-            self._llm = MockLLM()
-            self._ctx_cls = CouncilContext
-        except Exception:
-            self._llm = None
-            self._ctx_cls = None
+        # 【P1-12 修复】原实现 try/except 包住「from ..adapters.mock_llm import ...」
+        # —— 这是包内纯 stdlib 模块，永不失败 → 降级分支不可达且误导（假装有真实降级）。
+        # 诚实做法：MockLLM 恒可用即直接构造；保留 _llm is None 兜底仅为防御性（基本不触发）。
+        from ..adapters.mock_llm import MockLLM, CouncilContext
+        self._llm = MockLLM()
+        self._ctx_cls = CouncilContext
 
     def _maybe_narrate(self) -> None:
         """用上一笔收益更新缓冲，并调 MockLLM 产出叙事（接地）。"""
