@@ -53,6 +53,12 @@ ACTION_TO_INT = {"LONG": 0, "SHORT": 1, "HOLD": 2}
 
 PAPER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "paper")
 
+# 【P2 修复】审计日志有界化：paper_journal.jsonl 原为 append-only、无轮转无截断，
+# 5min cron 长期运行会无限增长（~1MB/天、350MB/年）最终撑满磁盘。设阈值，超限时
+# 仅保留最近 JOURNAL_KEEP 行（约几天审计窗口），与短/长期记忆容量上限同思路。
+JOURNAL_MAX_BYTES = 6 * 1024 * 1024   # 6MB：超过才触发回收，避免小文件反复整读
+JOURNAL_KEEP = 20000                  # 保留行数（5min 节奏≈6天审计轨迹）
+
 # 【P1-29 修复】cron/守护并发锁：paper 输出（dashboard/journal/state）为全局文件，
 # 若 cron 间隔小于单次耗时，多进程并发写入会互相覆盖/截断。用 fcntl 全局排他锁，
 # 已有实例运行时后续实例直接退出，保证单写者（fail-closed 而非竞态损坏）。
@@ -357,10 +363,22 @@ def run_once(source: DataSource, council: FourRoleCouncil,
 
 def _write_outputs(records: List[dict]) -> None:
     os.makedirs(PAPER_DIR, exist_ok=True)
-    # 1) 追加日志
-    with open(os.path.join(PAPER_DIR, "paper_journal.jsonl"), "a", encoding="utf-8") as f:
+    # 1) 追加日志（审计轨迹）
+    journal_path = os.path.join(PAPER_DIR, "paper_journal.jsonl")
+    with open(journal_path, "a", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    # 【P2 修复】有界化回收：仅当文件超过阈值才整读并截留最近 JOURNAL_KEEP 行，
+    # 避免小文件每 tick 重读；稳态文件体积被钳在 ~6MB，永不上限增长。
+    try:
+        if os.path.getsize(journal_path) > JOURNAL_MAX_BYTES:
+            with open(journal_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > JOURNAL_KEEP:
+                with open(journal_path, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-JOURNAL_KEEP:])
+    except OSError:
+        pass
     # 2) 最新状态（仪表盘数据源）
     with open(os.path.join(PAPER_DIR, "paper_state.json"), "w", encoding="utf-8") as f:
         json.dump({"updated": time.time(), "records": records}, f, ensure_ascii=False, indent=2)
