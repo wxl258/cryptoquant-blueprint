@@ -91,6 +91,8 @@ def _real_forward_wf(signals, paths, windows: int = 5, is_ratio: float = 0.6,
                 wins += 1
     dsr = 0.0
     if oos_returns:
+        # 非年化口径 periods_per_year=1（逐bar）:A/B 两策略同口径比较,裁决(p 值,sr0=0)不受影响;
+        # 与阶段0.5 DSR(N) 多重检验单调演示一致(年化 8760 会让 PSR 饱和到 1.0,掩盖 N 越大越保守)。
         per = [deflated_sharpe(r, n_trials=1, sr0=0.0, periods_per_year=1)
                for r in oos_returns if len(r) >= 5]
         dsr = float(np.mean(per)) if per else 0.0
@@ -176,8 +178,9 @@ def main() -> int:
     ab0 = controlled_ab(make_synthetic_returns(300, 0.15, seed=11),
                         make_synthetic_returns(300, 0.45, seed=12),
                         n_trials=20, sr0=0.0, periods_per_year=1)
+    # 【机制自检】仅验证 A/B 闸门能跑出合法 winner（非策略裁决）；策略裁决见 ⑤ 受控 A/B。
     ab_runs = ab0.winner in ("llm", "rule") and ab0.dsr_llm != ab0.dsr_rule
-    print(f"   受控 A/B: 胜方={ab0.winner} 显著={ab0.significant} → {'✅' if ab_runs else '❌'}")
+    print(f"   [A/B 机制自检] 受控 A/B: 胜方={ab0.winner} 显著={ab0.significant} → {'✅' if ab_runs else '❌'}")
     results["stage0_5_reconfirm"] = iso_active and dsr_mono and spi_ok and ab_runs
 
     # ---- 共享记忆（③ 与 ⑤ 复用，体现反思自改进喂给 A/B）----
@@ -262,13 +265,15 @@ def main() -> int:
     flat_rule = [r for fold in oos_r_rule for r in fold]
     flat_llm = [r for fold in oos_r_llm for r in fold]
     N = max(1, len(llm_sigs))
+    # periods_per_year=1 与 _real_forward_wf 同口径(非年化);p 值用 Welch(sr0=0),不受年化影响。
     ab = controlled_ab(flat_rule, flat_llm, n_trials=N, sr0=0.0,
                        alpha=0.05, periods_per_year=1)
-    print(f"   规则   DSR(N={N})={dsr_rule:.3f} OOS盈利窗={wr_r:.0%} "
+    # 以下为 PSR（deflated_sharpe(n_trials=1)）,非 DSR;口径 periods_per_year=1（非年化,见 _real_forward_wf）。
+    print(f"   规则   PSR(N={N})={dsr_rule:.3f} OOS盈利窗={wr_r:.0%} "
           f"净化剪bar purge={pbr} embargo={ebr}")
-    print(f"   四角色 DSR(N={N})={dsr_llm:.3f} OOS盈利窗={wr_l:.0%} "
+    print(f"   四角色 PSR(N={N})={dsr_llm:.3f} OOS盈利窗={wr_l:.0%} "
           f"净化剪bar purge={pbl} embargo={ebl}")
-    print(f"   受控 A/B: ΔDSR={dsr_llm-dsr_rule:+.3f}  p={ab.p_value:.4f} "
+    print(f"   受控 A/B: ΔPSR={dsr_llm-dsr_rule:+.3f}  p={ab.p_value:.4f} "
           f"显著={ab.significant} 胜方={ab.winner}")
 
     # 诚实裁决：显著优于规则才放行 LLM，否则回退规则

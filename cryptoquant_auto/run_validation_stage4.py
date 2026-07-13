@@ -91,6 +91,8 @@ def _real_forward_wf(signals, paths, windows: int = 5, is_ratio: float = 0.6,
                 wins += 1
     dsr = 0.0
     if oos_returns:
+        # 非年化口径 periods_per_year=1（逐bar）:A/B 两策略同口径比较,裁决(p 值,sr0=0)不受影响;
+        # 与阶段0.5 DSR(N) 多重检验单调演示一致(年化 8760 会让 PSR 饱和到 1.0,掩盖 N 越大越保守)。
         per = [deflated_sharpe(r, n_trials=1, sr0=0.0, periods_per_year=1)
                for r in oos_returns if len(r) >= 5]
         dsr = float(np.mean(per)) if per else 0.0
@@ -296,6 +298,7 @@ def main() -> int:
     flat_base = [x for fold in oos_r_base for x in fold]
     flat_tsfm = [x for fold in oos_r_tsfm for x in fold]
     N = max(1, len(tsfm_sigs))
+    # periods_per_year=1 与 _real_forward_wf 同口径(非年化);p 值用 Welch(sr0=0),不受年化影响。
     ab = controlled_ab(flat_base, flat_tsfm, n_trials=N, sr0=0.0,
                        alpha=0.05, periods_per_year=1)
     # 【P1-14/quant 修复】_real_forward_wf 用 deflated_sharpe(n_trials=1) 逐 fold 聚合，
@@ -303,7 +306,7 @@ def main() -> int:
     # （n_trials=N 多重检验校正，见下方 p 值）。这里如实标注为 PSR。
     print(f"   动量基线 PSR(N={N})={dsr_base:.3f} 盈利窗={wr_b:.0%} 剪bar purge={pbb} embargo={ebb}")
     print(f"   TSFM    PSR(N={N})={dsr_tsfm:.3f} 盈利窗={wr_t:.0%} 剪bar purge={pbt} embargo={ebt}")
-    print(f"   ΔDSR={dsr_tsfm-dsr_base:+.3f}  p={ab.p_value:.4f} 显著={ab.significant} 胜方={ab.winner}")
+    print(f"   ΔPSR={dsr_tsfm-dsr_base:+.3f}  p={ab.p_value:.4f} 显著={ab.significant} 胜方={ab.winner}")
     recommend = (dsr_tsfm > dsr_base) and ab.significant and dsr_tsfm > 0 and dsr_base > 0
     print(f"   → {'✅TSFM 显著优于基线' if recommend else '🔒未证明更优（诚实，不伪造 edge）'}")
     gate_6 = (pbt > 0 and ebt > 0) and ab.p_value is not None and (recommend or not recommend)
