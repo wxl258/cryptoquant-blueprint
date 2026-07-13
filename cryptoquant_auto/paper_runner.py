@@ -12,7 +12,8 @@
 运行：
   python3 -m cryptoquant_auto.paper_runner --once          # 单次（沙箱/调试）
   python3 -m cryptoquant_auto.paper_runner --loop --interval 300   # 持续（服务器 cron/守护）
-  python3 -m cryptoquant_auto.paper_runner --source gateio  # 接只读实时行情（服务器）
+  python3 -m cryptoquant_auto.paper_runner --source binance # 币安只读实时（服务器主用）
+  python3 -m cryptoquant_auto.paper_runner --source gateio  # Gate.io 只读实时（备选）
 
 依赖：stage2_features / meta.agents / risk.constitution / adapters.real_llm（均已就位）。
 """
@@ -202,6 +203,102 @@ class GateioPublicDataSource(DataSource):
         return out
 
 
+class BinancePublicDataSource(DataSource):
+    """只读公开 REST（无需 API 密钥）拉实时行情。币安主用，Gate.io 备选。
+
+    端点（币安 U 本位合约 fapi，公开只读，不签名、不下单）：
+      - fapi/v1/klines                1h K 线
+      - fapi/v1/fundingRate          资金费率（fr）
+      - futures/data/openInterestHist 持仓量（计算 oi_pct）
+    全部只读、不签名、不下单。任一币拉取失败则跳过该币，不影响整体。
+
+    关于「API 密钥」：公开行情无需密钥；fail-closed 架构也禁止接任何可下单的
+    实盘/测试网适配器（见 adapters/binance_testnet.py，仅在非 paper 路径使用）。
+    若日后需更高限速的「已鉴权公开」端点，密钥须经服务器环境变量注入，勿明文进代码/聊天。
+    """
+
+    BASE = "https://fapi.binance.com/fapi/v1"
+    OI_BASE = "https://fapi.binance.com/futures/data"
+    FNG = "https://api.alternative.me/fng/?limit=1"
+    SYMBOLS = ["BTC", "ETH", "SOL", "BNB", "XRP", "TRX",
+               "DOGE", "ADA", "AVAX", "LINK", "TON", "SUI"]
+
+    def __init__(self, warmup: int = 240, limit: int = 500):
+        self.warmup = warmup
+        self.limit = limit
+        self._fng = 50.0
+
+    @staticmethod
+    def _get_json(url: str, timeout: float = 10.0):
+        req = urllib.request.Request(url, headers={"User-Agent": "cryptoquant-paper/0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def _refresh_fng(self):
+        try:
+            self._fng = float(self._get_json(self.FNG).get("data", [{}])[0].get("value", 50))
+        except Exception:
+            pass
+
+    def symbols(self) -> List[str]:
+        return self.SYMBOLS
+
+    def snapshot(self) -> Dict[str, dict]:
+        self._refresh_fng()
+        out: Dict[str, dict] = {}
+        for s in self.SYMBOLS:
+            try:
+                sym = f"{s}USDT"
+                now_ms = int(time.time() * 1000)
+                url = (f"{self.BASE}/klines?symbol={sym}&interval=1h"
+                       f"&startTime={now_ms - 86400 * 30 * 1000}&limit={self.limit}")
+                raw = self._get_json(url)
+                # 币安 klines 为数组：
+                # [openTime, open, high, low, close, volume, closeTime, ...]（毫秒时间戳）
+                k1h = []
+                for r in raw:
+                    k1h.append({"t": int(r[0]) // 1000, "o": float(r[1]),
+                                "h": float(r[2]), "l": float(r[3]),
+                                "c": float(r[4]), "v": float(r[5])})
+                if len(k1h) < self.warmup + 2:
+                    continue
+                i = len(k1h) - 1
+                w = k1h[:i + 1]
+                closes = [c["c"] for c in w]
+                # 资金费率
+                fr = 0.0
+                try:
+                    fr_raw = self._get_json(f"{self.BASE}/fundingRate?symbol={sym}&limit=1")
+                    if fr_raw:
+                        fr = float(fr_raw[-1].get("fundingRate", 0.0) or 0.0)
+                except Exception:
+                    pass
+                # 持仓量变化（oi_pct）：取最近两期 5m 快照
+                oi_pct = 0.0
+                try:
+                    oi_raw = self._get_json(
+                        f"{self.OI_BASE}/openInterestHist?symbol={sym}&period=5m&limit=2")
+                    if (len(oi_raw) >= 2
+                            and float(oi_raw[-2].get("sumOpenInterest", 0) or 0)):
+                        oi_pct = (float(oi_raw[-1]["sumOpenInterest"])
+                                  - float(oi_raw[-2]["sumOpenInterest"])) \
+                            / float(oi_raw[-2]["sumOpenInterest"])
+                except Exception:
+                    pass
+                fg = self._fng
+                feat = assemble_feature(closes, w, fr, 0.0, oi_pct, fg, i)
+                out[s] = {
+                    "feat": np.array(feat, dtype=float),
+                    "regime": _regime_of(closes),
+                    "price": float(k1h[i]["c"]),
+                    "ts": int(k1h[i]["t"]),
+                }
+            except Exception as e:
+                logger.warning("[binance] %s 拉取失败: %s", s, e)
+                continue
+        return out
+
+
 # ---------------------------------------------------------------------------
 # 纸面决策（喂给宪法做合规校验的轻量载体）
 # ---------------------------------------------------------------------------
@@ -297,8 +394,8 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="单次运行（默认）")
     ap.add_argument("--loop", action="store_true", help="持续运行（守护/cron）")
     ap.add_argument("--interval", type=int, default=300, help="循环间隔秒（默认 300）")
-    ap.add_argument("--source", choices=["history", "gateio"], default="history",
-                    help="数据源：history 回放（默认） / gateio 只读实时")
+    ap.add_argument("--source", choices=["history", "binance", "gateio"], default="history",
+                    help="数据源：history 回放（默认，沙箱安全）/ binance 只读实时（主用）/ gateio 只读实时（备选）")
     ap.add_argument("--log-file", default=None,
                     help="日志落盘路径（守护/生产建议指定，启用 RotatingFileHandler 轮转）")
     args = ap.parse_args()
@@ -323,7 +420,13 @@ def main() -> int:
         lock_fd.close()
         return 0
 
-    source = GateioPublicDataSource() if args.source == "gateio" else HistoryDataSource()
+    # 数据源选择：binance 主用（U 本位合约只读）/ gateio 备选 / history 沙箱回放
+    if args.source == "binance":
+        source = BinancePublicDataSource()
+    elif args.source == "gateio":
+        source = GateioPublicDataSource()
+    else:
+        source = HistoryDataSource()
     memory = FinMemMemory()
     council = FourRoleCouncil(memory, llm=get_llm())
     constitution = TradingConstitution(live_capital=LIVE_CAPITAL)
