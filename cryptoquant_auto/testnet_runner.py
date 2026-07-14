@@ -41,14 +41,28 @@ _STEP_SIZES = {
     "LINK": 0.01, "TON": 0.1, "SUI": 0.1,
 }
 
+# 限价单价格步长（PRICE_FILTER.tickSize，粗略但够用）
+_PRICE_STEPS = {
+    "BTC": 0.1, "ETH": 0.01, "SOL": 0.001,
+    "BNB": 0.01, "XRP": 0.0001, "TRX": 0.00001,
+    "DOGE": 0.00001, "ADA": 0.0001, "AVAX": 0.01,
+    "LINK": 0.001, "TON": 0.001, "SUI": 0.001,
+}
+
 
 def _fmt_qty(symbol: str, qty: float) -> float:
     """按步长向下取整，拒绝超精度错误（-1111）。"""
     step = _STEP_SIZES.get(symbol, 0.001)
     adjusted = int(qty / step) * step
-    # 根据 step 的小数位数精确截断浮点噪声
     precision = max(0, -int(math.floor(math.log10(step))))
     return round(adjusted, precision)
+
+
+def _fmt_price(symbol: str, price: float) -> float:
+    """按 PRICE_FILTER.tickSize 截断价格精度（防 -4014）。"""
+    step = _PRICE_STEPS.get(symbol, 0.01)
+    precision = max(0, -int(math.floor(math.log10(step))))
+    return round(price, precision)
 
 PAPER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "paper")
 
@@ -133,7 +147,7 @@ def sync_positions(adapter: BinanceTestnetAdapter,
                 qty = round(abs(cur.qty), 6)
                 if qty > 0:
                     # 平仓用激进限价确保成交：市价的 0.5% 让步
-                    limit_price = round(price * 1.005 if side == "BUY" else price * 0.995, 2)
+                    limit_price = _fmt_price(sym, price * 1.005 if side == "BUY" else price * 0.995)
                     resp = adapter.submit_market(sym, side, qty, price=limit_price)
                     trades.append({"symbol": sym, "action": "CLOSE",
                                    "side": side, "qty": qty,
@@ -150,7 +164,7 @@ def sync_positions(adapter: BinanceTestnetAdapter,
             close_side = "SELL" if cur_dir == "LONG" else "BUY"
             qty = round(abs(cur.qty), 6)
             if qty > 0:
-                limit_price = round(price * 1.005 if close_side == "BUY" else price * 0.995, 2)
+                limit_price = _fmt_price(sym, price * 1.005 if close_side == "BUY" else price * 0.995)
                 adapter.submit_market(sym, close_side, qty, price=limit_price)
                 trades.append({"symbol": sym, "action": "CLOSE",
                                "side": close_side, "qty": qty})
@@ -161,7 +175,7 @@ def sync_positions(adapter: BinanceTestnetAdapter,
         if qty < 0.001:
             logger.warning("  [testnet] %s qty=%s 过小跳过", sym, qty)
             continue
-        limit_price = round(price * 1.005 if open_side == "BUY" else price * 0.995, 2)
+        limit_price = _fmt_price(sym, price * 1.005 if open_side == "BUY" else price * 0.995)
         resp = adapter.submit_market(sym, open_side, qty,
                                      signal_id=f"sig_{sym}", price=limit_price)
         trades.append({"symbol": sym, "action": f"OPEN_{action}",
