@@ -12,10 +12,14 @@
 
 供应商切换（均 OpenAI 兼容 chat-completions + Function Calling 锁表）：
   - 默认（不设）指向 OpenAI 官方，模型 gpt-4o-mini
-  - DeepSeek：设 CRYPTOQUANT_LLM_BASE_URL=https://api.deepseek.com
-                  CRYPTOQUANT_LLM_MODEL=deepseek-chat   （V3，支持 tools）
-              ⚠️ 勿用 deepseek-reasoner(R1)：其 API 不吐 tool_calls，会触发 fail-closed 降级为 Mock
-  - 其他 OpenAI 兼容端点同理，仅改 base_url / model 两个环境变量，零改代码
+  - DeepSeek（最新一代 V4）：设
+        CRYPTOQUANT_LLM_BASE_URL=https://api.deepseek.com
+        CRYPTOQUANT_LLM_MODEL=deepseek-v4-flash   （推荐：低成本快；支持 tools）
+                             或 deepseek-v4-pro    （质量优先；支持 tools）
+    ⚠️ 旧 deepseek-chat / deepseek-reasoner 将于 2026-07-24 15:59 UTC 退役，勿再用。
+       V4 的 reasoning 是参数(thinking)而非独立模型，默认非思考模式即吐 tool_calls，锁表正常。
+  - 其他 OpenAI 兼容端点同理，仅改 base_url / model，零改代码
+  - 健壮性：模型若未吐 tool_calls 但在 content 返回 JSON，也会解析并走同一严格 schema 校验（锁表不破）
 
 降级纪律：调用失败（超时/拒答/越界）默认降级为 MockLLM 填表（fail-closed，不阻塞管线）；
 设 degrade_on_error=False 可改为硬失败（上线初期暴露问题用）。
@@ -32,6 +36,27 @@ from .mock_llm import (
 )
 
 logger = logging.getLogger("cryptoquant.real_llm")
+
+
+def _extract_json(text: str):
+    """从模型 content 中提取 JSON 对象（兼容 ```json 围栏与前后夹杂文本）。
+
+    仅用于 tool_calls 缺失时的兜底解析；提取出的 dict 仍须经 LLMDecision.validate()
+    严格 schema 校验，锁表保证不破。
+    """
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        s, e = text.find("{"), text.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            return json.loads(text[s:e + 1])
+        raise
 
 
 class RealLLM:
@@ -104,9 +129,18 @@ class RealLLM:
             temperature=0.0,
         )
         msg = resp.choices[0].message
-        if not msg.tool_calls:
-            raise SchemaValidationError("LLM 未返回工具调用（未锁表）")
-        args = json.loads(msg.tool_calls[0].function.arguments)
+        args = None
+        if msg.tool_calls:
+            args = msg.tool_calls[0].function.arguments
+        elif msg.content and msg.content.strip():
+            # 健壮性：推理/思考模型可能不吐 tool_calls，而在 content 返回 JSON。
+            # 仍走同一严格 schema 校验，锁表保证不破（fail-closed）。
+            args = _extract_json(msg.content)
+        if not args:
+            raise SchemaValidationError(
+                "LLM 未返回工具调用且 content 非合法 JSON（未锁表）")
+        if isinstance(args, str):
+            args = json.loads(args)
         # 复用严格 schema 校验：越界直接拒（等价于 pydantic 失败）
         return LLMDecision(**args).validate()
 
