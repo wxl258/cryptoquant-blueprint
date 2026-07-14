@@ -144,12 +144,6 @@ class BinanceTestnetAdapter(ExchangeAdapter):
             params = {"symbol": self._sym(symbol), "side": side,
                       "quantity": round(qty, 6), "type": "MARKET",
                       "newClientOrderId": f"mkt_{symbol}_{side}_{int(time.time())}"}
-        elif price and price > 0:
-            params = {"symbol": self._sym(symbol), "side": side,
-                      "quantity": round(qty, 6), "type": "LIMIT",
-                      "price": f"{price:.8f}".rstrip("0").rstrip("."),
-                      "timeInForce": "GTC",
-                      "newClientOrderId": f"mkt_{symbol}_{side}_{int(time.time())}"}
         r = self.sess.post(BASE + "/fapi/v1/order", params=self._sign(params),
                            timeout=self._timeout)
         data = r.json()
