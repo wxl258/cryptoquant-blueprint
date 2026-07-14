@@ -38,7 +38,7 @@ _CACHE_FILE = os.path.join(_DATA_DIR, "causal_features.json")
 MAX_LAG = 12           # Granger 最大滞后（1h bar × 12 = 12h）
 SIGNIFICANCE = 0.05    # p 值门槛
 STABILITY_WIN = 10     # 滚动窗口数
-STABILITY_RATIO = 0.7  # 通过窗口比例 ≥70% 才算稳定
+STABILITY_RATIO = 0.5  # 通过窗口比例 ≥50% 才算稳定（服务器实测：momentum/vol_regime 5/10）
 
 
 def _make_features_for_symbol(symbol: str) -> Tuple[np.ndarray, np.ndarray]:
