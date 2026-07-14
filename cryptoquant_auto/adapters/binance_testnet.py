@@ -150,6 +150,12 @@ class BinanceTestnetAdapter(ExchangeAdapter):
                 self._open_position(o, ap)
                 self.fills.append(Fill(
                     o.coid, symbol, side, ap, fq, time.time()))
+        else:
+            # 非预期响应（典型：密钥错误 / 权限不足 / 参数越界）
+            logger = __import__("logging").getLogger("cryptoquant.testnet")
+            logger.warning("[submit_market] %s %s http=%d code=%s msg=%s",
+                          symbol, side, getattr(r, "status_code", 0),
+                          data.get("code", "?"), data.get("msg", "?"))
         return data
 
     def simulate_market(self, prices: dict) -> None:
