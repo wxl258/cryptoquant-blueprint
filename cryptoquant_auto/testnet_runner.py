@@ -100,36 +100,83 @@ def _fetch_prices(symbols: List[str]) -> Dict[str, float]:
     return prices
 
 
+def _load_fill_history() -> List[dict]:
+    """读取跨 run 成交历史（paper/fill_history.json）。"""
+    path = os.path.join(PAPER_DIR, "fill_history.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def _save_fill_history(history: List[dict]) -> None:
+    path = os.path.join(PAPER_DIR, "fill_history.json")
+    with open(path, "w") as f:
+        json.dump(history, f, ensure_ascii=False)
+
+
+def _close_position(adapter: BinanceTestnetAdapter, sym: str,
+                    cur, price: float, trades: List[dict]) -> None:
+    """按真实持仓量平仓（激进限价），记录回执。"""
+    cur_dir = "LONG" if cur.direction == Direction.LONG else "SHORT"
+    side = "SELL" if cur_dir == "LONG" else "BUY"
+    qty = round(abs(cur.qty), 6)
+    if qty <= 0:
+        return
+    # 市价单平仓：测试网部分交易对 PRICE_FILTER 过期(minPrice 远高于现价)，
+    # 限价单会被价格过滤器拒绝(-4014)；市价单绕开价格过滤器且实测可成交。
+    resp = adapter.submit_market(sym, side, qty)
+    trades.append({"symbol": sym, "action": "CLOSE",
+                   "side": side, "qty": qty,
+                   "resp": resp.get("status", "ERROR"),
+                   "ok": bool(resp.get("ok", False)),
+                   "code": resp.get("code")})
+    logger.info("  [testnet] %s 平仓 %s qty=%s", sym, side, qty)
+
+
 def _calc_pnl(adapter: BinanceTestnetAdapter) -> dict:
-    """汇总测试网 P&L。"""
-    fills = getattr(adapter, "fills", [])
-    logger.info("[debug]  fills=%d positions=%d balance_wallet=%s",
-                len(fills), len(adapter.query_positions()),
-                "" if not hasattr(adapter, '_client') else '?')
-    realized = sum(f.price * f.qty * (1 if f.side == "SELL" else -1)
-                   for f in fills) * -1  # 简算（未计手续费）
+    """汇总测试网 P&L；成交数与已实现盈亏跨 run 持久化（修复'累计'口径）。"""
+    run_fills = getattr(adapter, "fills", [])
+    history = _load_fill_history()
+    for f in run_fills:
+        history.append({"coid": f.coid, "symbol": f.symbol, "side": f.side,
+                        "price": float(f.price), "qty": float(f.qty),
+                        "ts": float(f.ts)})
+    _save_fill_history(history)
+    logger.info("[debug] run_fills=%d history=%d positions=%d",
+                len(run_fills), len(history), len(adapter.query_positions()))
+    # 简算已实现（未计手续费/资金费）；现基于跨 run 累计历史，标签才名副其实
+    realized = sum(f["price"] * f["qty"] * (1 if f["side"] == "SELL" else -1)
+                   for f in history) * -1
     positions = adapter.query_positions()
-    unrealized = 0.0
-    pos_details = []
-    for p in positions:
-        # 最新价从 fills 获取或缺省
-        entry_cost = p.entry_price * abs(p.qty)
-        m2m = p.entry_price * abs(p.qty) * 0  # 占位
-        pos_details.append({
-            "symbol": p.symbol, "direction": p.direction.value,
-            "qty": float(p.qty), "entry_price": float(p.entry_price),
-            "unrealized_pnl": 0.0,
-        })
+    pos_details = [{
+        "symbol": p.symbol, "direction": p.direction.value,
+        "qty": float(p.qty), "entry_price": float(p.entry_price),
+        "unrealized_pnl": 0.0,
+    } for p in positions]
     return {"realized_pnl": round(realized, 2), "unrealized_pnl": 0.0,
-            "positions": pos_details, "total_fills": len(fills)}
+            "positions": pos_details, "total_fills": len(history)}
 
 
 def sync_positions(adapter: BinanceTestnetAdapter,
                     signals: Dict[str, str],
                     prices: Dict[str, float]) -> List[dict]:
-    """根据最新信号同步测试网持仓核心逻辑。"""
+    """根据最新信号同步测试网持仓（跨 run 持久化真实持仓/挂单）。
+
+    修复：先拉测试网真实持仓与挂单，否则每轮从空开始会重复开单、无力平仓历史单；
+    持仓/挂单按真实状态决策，冲突挂单先撤。
+    """
     trades: List[dict] = []
+    # 刷新失败（网络/非200/json异常）→ 返回 None；此时内存持仓为空，
+    # 若继续会盲目重复开单，故跳过本轮，等下次 cron 重试。
+    if adapter.refresh_positions() is None or adapter.refresh_open_orders() is None:
+        logger.error("[testnet] 持仓/挂单刷新失败, 跳过本轮, 避免盲目重复开单")
+        return trades
     positions_map = {p.symbol: p for p in adapter.query_positions()}
+    open_map = {o.symbol: o for o in adapter.query_open()}
 
     for sym, action in signals.items():
         if sym not in prices or not prices[sym]:
@@ -139,48 +186,44 @@ def sync_positions(adapter: BinanceTestnetAdapter,
         cur_dir = None
         if cur and cur.qty > 1e-9:
             cur_dir = "LONG" if cur.direction == Direction.LONG else "SHORT"
+        op = open_map.get(sym)
+        open_dir = ("LONG" if op.side == "BUY" else "SHORT") if op else None
 
-        # 信号 HOLD → 平仓出场
+        # 信号 HOLD → 平仓出场 + 撤销该币挂单
         if action == "HOLD":
             if cur_dir:
-                side = "SELL" if cur_dir == "LONG" else "BUY"
-                qty = round(abs(cur.qty), 6)
-                if qty > 0:
-                    # 平仓用激进限价确保成交：市价的 0.5% 让步
-                    limit_price = _fmt_price(sym, price * 1.005 if side == "BUY" else price * 0.995)
-                    resp = adapter.submit_market(sym, side, qty, price=limit_price)
-                    trades.append({"symbol": sym, "action": "CLOSE",
-                                   "side": side, "qty": qty,
-                                   "resp": resp.get("status", "?")})
-                    logger.info("  [testnet] %s 平仓 %s qty=%s", sym, side, qty)
+                _close_position(adapter, sym, cur, price, trades)
+            if op:
+                adapter.cancel(op.coid)
             continue
 
-        # 信号与持仓方向一致 → 跳过
+        # 信号与持仓方向一致 → 跳过（不重复开）
         if cur_dir == action:
             continue
 
-        # 信号反转 → 平旧仓（也用激进限价）
+        # 方向反转 → 先平旧仓 + 撤冲突挂单，再开新仓
         if cur_dir:
-            close_side = "SELL" if cur_dir == "LONG" else "BUY"
-            qty = round(abs(cur.qty), 6)
-            if qty > 0:
-                limit_price = _fmt_price(sym, price * 1.005 if close_side == "BUY" else price * 0.995)
-                adapter.submit_market(sym, close_side, qty, price=limit_price)
-                trades.append({"symbol": sym, "action": "CLOSE",
-                               "side": close_side, "qty": qty})
+            _close_position(adapter, sym, cur, price, trades)
+        if open_dir and open_dir != action:
+            adapter.cancel(op.coid)
 
-        # 开新仓（用激进 LIMIT 替代 MARKET 解决测试网不成交）
+        # 开新仓（市价单，绕开测试网过期价格过滤器）；已有同方向持仓则跳过，避免重复
         open_side = "BUY" if action == "LONG" else "SELL"
+        if open_dir == action:
+            logger.info("  [testnet] %s 已有同方向挂单, 跳过开仓", sym)
+            continue
         qty = _fmt_qty(sym, POS_SIZE_USDT * LEVERAGE / price)
         if qty < 0.001:
             logger.warning("  [testnet] %s qty=%s 过小跳过", sym, qty)
             continue
-        limit_price = _fmt_price(sym, price * 1.005 if open_side == "BUY" else price * 0.995)
+        # 市价单开仓：同上，绕开测试网过期价格过滤器，实测可成交。
         resp = adapter.submit_market(sym, open_side, qty,
-                                     signal_id=f"sig_{sym}", price=limit_price)
+                                     signal_id=f"sig_{sym}")
         trades.append({"symbol": sym, "action": f"OPEN_{action}",
                        "side": open_side, "qty": qty,
-                       "resp": resp.get("status", "?")})
+                       "resp": resp.get("status", "ERROR"),
+                       "ok": bool(resp.get("ok", False)),
+                       "code": resp.get("code")})
         logger.info("  [testnet] %s 开仓 %s qty=%s", sym, action, qty)
 
     return trades

@@ -9,3 +9,4 @@ paper/.paper_runner.lock
 paper/paper_state.json
 paper/paper_journal.jsonl
 paper/paper_dashboard.md
+.llm_secret

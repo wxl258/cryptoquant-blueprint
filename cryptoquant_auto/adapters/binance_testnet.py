@@ -10,6 +10,7 @@ import time
 import hmac
 import hashlib
 import urllib.parse
+import logging
 
 import requests
 
@@ -17,6 +18,7 @@ from ..models import Order, OrderStatus, OrderType, Position, Direction, Fill
 from .base import ExchangeAdapter
 
 BASE = "https://testnet.binancefuture.com"
+logger = logging.getLogger("cryptoquant.testnet")
 
 
 class BinanceTestnetAdapter(ExchangeAdapter):
@@ -123,90 +125,195 @@ class BinanceTestnetAdapter(ExchangeAdapter):
     def query_positions(self):
         return list(self.positions.values())
 
-    # ---- 成交（价格穿越检测；生产改 user data stream）----
-    def submit_market(self, symbol: str, side: str, qty: float,
-                      signal_id: str = "", price: float = 0) -> dict:
-        """市价入场单（测试网即刻成交，绕过 LIMIT-only submit 路径）。
+    def refresh_positions(self):
+        """从测试网 REST 拉取真实持仓，覆盖内存 self.positions（跨 run 持久化）。
 
-        参数同 Binance /fapi/v1/order：symbol（如 BTC）, side（BUY/SELL）, qty。
-        若传 price 则使用 LIMIT 激进限价(测试网 MARKET 常驻 NEW 不成交)。
-        返回测试网 API 原始 JSON；同时更新内部 position/fills 跟踪。
+        修复：原 query_positions 只读内存，每次 cron 新建适配器都从空开始，
+        导致看不到测试网既有持仓 → 重复开单、无法平仓历史单。
+        失败返回 None（调用方据此跳过本轮，避免盲目重复开单）。
         """
+        try:
+            r = self.sess.get(BASE + "/fapi/v2/positionRisk",
+                              params=self._sign({}), timeout=self._timeout)
+        except (requests.RequestException, TimeoutError) as e:
+            logger.error("[refresh_positions] 网络失败, 跳过本轮: %s", e)
+            return None
+        if r.status_code != 200:
+            logger.error("[refresh_positions] http=%d %s", r.status_code, str(r.text)[:200])
+            return None
+        try:
+            data = r.json()
+        except Exception as e:
+            logger.error("[refresh_positions] json %s", e)
+            return None
+        self.positions = {}
+        for p in data:
+            amt = float(p.get("positionAmt", 0) or 0)
+            if abs(amt) < 1e-9:
+                continue
+            sym = str(p.get("symbol", "")).replace("USDT", "")
+            direction = Direction.LONG if amt > 0 else Direction.SHORT
+            self.positions[sym] = Position(
+                symbol=sym, direction=direction,
+                entry_price=float(p.get("entryPrice", 0) or 0),
+                qty=abs(amt), initial_qty=abs(amt),
+                sl_price=0.0, tp1_price=0.0, tp2_price=0.0,
+                entry_coid="", signal_id="")
+        logger.info("[refresh_positions] 拉取真实持仓 %d 个", len(self.positions))
+        return list(self.positions.values())
+
+    def refresh_open_orders(self):
+        """从测试网 REST 拉取真实挂单，覆盖内存 self.open_orders（避免重复挂单）。
+        失败返回 None。"""
+        try:
+            r = self.sess.get(BASE + "/fapi/v1/openOrders",
+                              params=self._sign({}), timeout=self._timeout)
+        except (requests.RequestException, TimeoutError) as e:
+            logger.error("[refresh_open_orders] 网络失败, 跳过本轮: %s", e)
+            return None
+        if r.status_code != 200:
+            logger.error("[refresh_open_orders] http=%d %s", r.status_code, str(r.text)[:200])
+            return None
+        try:
+            data = r.json()
+        except Exception as e:
+            logger.error("[refresh_open_orders] json %s", e)
+            return None
+        self.open_orders = {}
+        for o in data:
+            coid = o.get("clientOrderId", "")
+            side = o.get("side", "")
+            sym = str(o.get("symbol", "")).replace("USDT", "")
+            order = Order(
+                coid=coid, symbol=sym, side=side, otype=OrderType.ENTRY,
+                price=float(o.get("price", 0) or 0),
+                qty=float(o.get("origQty", 0) or 0), signal_id="")
+            order.status = OrderStatus.OPEN
+            self.open_orders[coid] = order
+        logger.info("[refresh_open_orders] 拉取真实挂单 %d 个", len(self.open_orders))
+        return list(self.open_orders.values())
+
+    # ---- 成交（价格穿越检测；生产改 user data stream）----
+    def query_order(self, symbol: str, coid: str = "", order_id: int = 0):
+        '''按 newClientOrderId / orderId 回查订单真实状态（回执确认用）。'''
+        if not coid and not order_id:
+            return None
+        params = {"symbol": self._sym(symbol)}
+        if order_id:
+            params["orderId"] = order_id
+        else:
+            params["origClientOrderId"] = coid
+        try:
+            r = self.sess.get(BASE + "/fapi/v1/order",
+                              params=self._sign(params), timeout=self._timeout)
+        except (requests.RequestException, TimeoutError) as e:
+            logger.warning("[query_order] %s 回查失败: %s", symbol, e)
+            return {"ok": False, "status": "ERROR", "retryable": True,
+                    "error": f"net:{e}", "coid": coid}
+        if r.status_code == 400 and r.json().get("code") == -2013:
+            return {"ok": False, "status": "NOT_FOUND", "coid": coid}
+        return self._normalize_receipt(symbol, r.json().get("side", ""), 0.0, "", r, coid)
+
+    def _normalize_receipt(self, symbol: str, side: str, qty: float,
+                           signal_id: str, r, coid: str, raw=None):
+        '''把 Binance 原始响应规范化为带明确 status/ok 的回执（杜绝 '?'）。
+
+        status in {FILLED, NEW, PARTIALLY_FILLED, CANCELED, EXPIRED,
+                  REJECTED, ERROR, NOT_FOUND}
+        '''
+        try:
+            data = raw if raw is not None else r.json()
+        except Exception:
+            return {"ok": False, "status": "ERROR", "retryable": True,
+                    "error": "响应非JSON", "coid": coid}
+        if r.status_code != 200 or not data.get("orderId"):
+            code = data.get("code")
+            msg = data.get("msg", "")
+            retryable = (r.status_code in (429, 500, 502, 503, 504)) or (code in (429, -1003, -1021))
+            return {"ok": False, "status": "REJECTED", "retryable": retryable,
+                    "code": code, "msg": msg, "coid": coid,
+                    "error": f"http={r.status_code} code={code} {msg}"}
+        fq = float(data.get("executedQty", 0))
+        ap = float(data.get("avgPrice", data.get("price", 0)))
+        status = data.get("status", "NEW")
+        receipt = {"ok": True, "status": status, "order_id": data.get("orderId"),
+                   "coid": coid, "executed_qty": fq, "avg_price": ap,
+                   "code": data.get("code"), "msg": data.get("msg", "")}
+        if fq > 0:
+            o = Order(coid=data.get("clientOrderId", ""), symbol=symbol, side=side,
+                      otype=OrderType.ENTRY, price=ap, qty=fq, signal_id=signal_id)
+            o.filled_qty = fq
+            o.filled_price = ap
+            o.status = OrderStatus.FILLED
+            self._open_position(o, ap)
+            self.fills.append(Fill(o.coid, symbol, side, ap, fq, time.time()))
+            logger.info("[submit_market] %s %s FILLED qty=%s price=%s fills=%d positions=%d",
+                        symbol, side, fq, ap, len(self.fills), len(self.positions))
+        else:
+            logger.info("[submit_market] %s %s 已接受 status=%s orderId=%s (未即刻成交)",
+                        symbol, side, status, data.get("orderId"))
+        return receipt
+
+    def submit_market(self, symbol: str, side: str, qty: float,
+                      signal_id: str = "", price: float = 0,
+                      max_retries: int = 2, retry_backoff: float = 1.0):
+        '''市价/限价入场单（测试网即刻成交，绕过 LIMIT-only submit 路径）。
+
+        回执校验（核心修复）：
+          - 永远返回带明确 status/ok 的规范回执，杜绝 '?' 模糊态。
+          - 网络/超时/5xx/限频 视为可重试(transient)，用同一 newClientOrderId
+            幂等重试，不会重复下单。
+          - Binance 业务拒绝(无 orderId / 4xx 业务码)判定 REJECTED 并放弃，不重试。
+          - 已接受但未即刻成交(NEW)时，短等后按 coid 回查确认真实状态，避免悬空单。
+          - 重试耗尽仍不明时按 coid 回查：找到返回真实状态；未找到(-2013)判未成交。
+        '''
         if self.constitution.live_capital:
-            return {"status": "REJECTED", "reason": "live_capital=True 禁止下单"}
+            return {"ok": False, "status": "REJECTED",
+                    "reason": "live_capital=True 禁止下单", "coid": ""}
+        coid = f"mkt_{symbol}_{side}_{int(time.time() * 1000)}"
         if price and price > 0:
             params = {"symbol": self._sym(symbol), "side": side,
                       "quantity": round(qty, 6), "type": "LIMIT",
                       "price": f"{price:.8f}".rstrip("0").rstrip("."),
                       "timeInForce": "GTC",
-                      "newClientOrderId": f"mkt_{symbol}_{side}_{int(time.time())}"}
+                      "newClientOrderId": coid}
         else:
             params = {"symbol": self._sym(symbol), "side": side,
                       "quantity": round(qty, 6), "type": "MARKET",
-                      "newClientOrderId": f"mkt_{symbol}_{side}_{int(time.time())}"}
-        r = self.sess.post(BASE + "/fapi/v1/order", params=self._sign(params),
-                           timeout=self._timeout)
-        data = r.json()
-        if data.get("orderId"):
-            fq = float(data.get("executedQty", 0))
-            ap = float(data.get("avgPrice", data.get("price", 0)))
-            if fq > 0:
-                o = Order(
-                    coid=data.get("clientOrderId", ""), symbol=symbol,
-                    side=side, otype=OrderType.ENTRY,
-                    price=ap, qty=fq, signal_id=signal_id)
-                o.filled_qty = fq
-                o.filled_price = ap
-                o.status = OrderStatus.FILLED
-                self._open_position(o, ap)
-                self.fills.append(Fill(
-                    o.coid, symbol, side, ap, fq, time.time()))
-                # 调试确认
-                logger = __import__("logging").getLogger("cryptoquant.testnet")
-                logger.info("[submit_market] %s %s FILLED qty=%s price=%s "
-                           "fills=%d positions=%d",
-                           symbol, side, fq, ap,
-                           len(self.fills), len(self.positions))
-            else:
-                # 市价单已接受但尚未完全成交（测试网偶有延迟）
-                logger = __import__("logging").getLogger("cryptoquant.testnet")
-                logger.warning("[submit_market] %s %s PENDING orderId=%s "
-                              "status=%s fq=%s", symbol, side,
-                              data.get("orderId"), data.get("status", "?"), fq)
-                # 等 1.5s 后查一次订单状态看是否已成交
-                __import__("time").sleep(1.5)
-                oid = data.get("orderId")
-                try:
-                    qp = self.sess.get(
-                        BASE + "/fapi/v1/order",
-                        params=self._sign({"symbol": self._sym(symbol),
-                                           "orderId": oid}),
-                        timeout=self._timeout)
-                    od = qp.json()
-                    if od.get("status") == "FILLED":
-                        fq2 = float(od.get("executedQty", 0))
-                        ap2 = float(od.get("avgPrice", od.get("price", 0)))
-                        if fq2 > 0:
-                            o = Order(
-                                coid=od.get("clientOrderId",""), symbol=symbol,
-                                side=side, otype=OrderType.ENTRY,
-                                price=ap2, qty=fq2, signal_id=signal_id)
-                            o.filled_qty = fq2; o.filled_price = ap2
-                            o.status = OrderStatus.FILLED
-                            self._open_position(o, ap2)
-                            self.fills.append(Fill(
-                                o.coid, symbol, side, ap2, fq2, time.time()))
-                            logger.info("[submit_market] %s %s FILLED(retry) "
-                                        "qty=%s price=%s", symbol, side, fq2, ap2)
-                except Exception as e:
-                    logger.warning("[submit_market] retry query %s: %s", oid, e)
-        else:
-            # 非预期响应（典型：密钥错误 / 权限不足 / 参数越界）
-            logger = __import__("logging").getLogger("cryptoquant.testnet")
-            logger.warning("[submit_market] %s %s http=%d code=%s msg=%s",
-                          symbol, side, getattr(r, "status_code", 0),
-                          data.get("code", "?"), data.get("msg", "?"))
-        return data
+                      "newClientOrderId": coid}
+        last_err = None
+        for attempt in range(max_retries + 1):
+            try:
+                r = self.sess.post(BASE + "/fapi/v1/order",
+                                   params=self._sign(params), timeout=self._timeout)
+            except (requests.RequestException, TimeoutError) as e:
+                last_err = f"net:{e}"
+                logger.warning("[submit_market] %s %s 网络异常(第%d次): %s",
+                               symbol, side, attempt + 1, e)
+                time.sleep(retry_backoff)
+                continue
+            receipt = self._normalize_receipt(symbol, side, qty, signal_id, r, coid)
+            if receipt["ok"]:
+                if (receipt.get("executed_qty", 0) <= 0
+                        and receipt.get("status") in ("NEW", "PARTIALLY_FILLED", "PENDING_NEW")):
+                    time.sleep(1.5)
+                    conf = self.query_order(symbol, coid=coid)
+                    if conf and conf.get("ok") and conf.get("executed_qty", 0) > 0:
+                        return conf
+                return receipt
+            if not receipt.get("retryable"):
+                return receipt
+            last_err = receipt.get("error")
+            time.sleep(retry_backoff)
+        conf = self.query_order(symbol, coid=coid)
+        if conf and conf.get("ok"):
+            return conf
+        if conf and conf.get("status") == "NOT_FOUND":
+            return {"ok": False, "status": "REJECTED",
+                    "error": "回查未找到该订单，判定未成交", "coid": coid}
+        return {"ok": False, "status": "ERROR", "retryable": True,
+                "error": last_err or "重试耗尽", "coid": coid}
+
 
     def simulate_market(self, prices: dict) -> None:
         for coid, o in list(self.open_orders.items()):
@@ -234,7 +341,28 @@ class BinanceTestnetAdapter(ExchangeAdapter):
         return False
 
     def _open_position(self, o: Order, p: float) -> None:
+        """按成交更新持仓；反向成交做净额（平仓/减仓正确清零），同向做加权。
+
+        修复：原实现总是覆盖为同向持仓，导致平仓后仪表盘残留反向幽灵持仓。
+        """
         direction = Direction.LONG if o.side == "BUY" else Direction.SHORT
+        existing = self.positions.get(o.symbol)
+        if existing and existing.direction != direction:
+            remaining = existing.qty - o.filled_qty
+            if remaining <= 1e-9:
+                del self.positions[o.symbol]
+            else:
+                existing.qty = remaining
+                existing.initial_qty = remaining
+            return
+        if existing and existing.direction == direction:
+            total = existing.qty + o.filled_qty
+            if total > 1e-9:
+                existing.entry_price = (existing.entry_price * existing.qty
+                                        + p * o.filled_qty) / total
+            existing.qty = total
+            existing.initial_qty = total
+            return
         self.positions[o.symbol] = Position(
             symbol=o.symbol, direction=direction, entry_price=p, qty=o.filled_qty,
             initial_qty=o.filled_qty, sl_price=0.0, tp1_price=0.0, tp2_price=0.0,

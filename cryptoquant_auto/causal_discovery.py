@@ -34,6 +34,39 @@ _DATA_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "data")
 _CACHE_FILE = os.path.join(_DATA_DIR, "causal_features.json")
 
+
+def _load_cache() -> dict:
+    """读取「按 symbol 分桶」的因果缓存；损坏/缺失返回空 dict。"""
+    try:
+        if os.path.exists(_CACHE_FILE):
+            with open(_CACHE_FILE) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_cache_entry(symbol: str, result: dict) -> None:
+    """把单币因果结果写入分桶缓存（修复旧版单文件只能存一个币 → 多币缓存失效的 bug）。
+
+    缓存结构：{symbol: {"features": [...], "details": {...}, "symbol": s, "ts": <unix>}}。
+    """
+    cache = _load_cache()
+    cache[symbol] = {
+        "features": result.get("features", []),
+        "details": result.get("details", {}),
+        "symbol": symbol,
+        "ts": time.time(),
+    }
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        with open(_CACHE_FILE, "w") as f:
+            json.dump(cache, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("因果缓存写入失败（不致命）：%s", e)
+
 # 默认参数
 MAX_LAG = 12           # Granger 最大滞后（1h bar × 12 = 12h）
 SIGNIFICANCE = 0.05    # p 值门槛
@@ -165,30 +198,26 @@ def discover(symbol: str = "BTC", force: bool = False) -> dict:
         stable_feats = list(FEATURE_NAMES)
 
     result = {"symbol": symbol, "features": stable_feats, "details": details}
-    os.makedirs(_DATA_DIR, exist_ok=True)
-    with open(_CACHE_FILE, "w") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
+    _save_cache_entry(symbol, result)
     logger.info("因果发现完成: %s 稳定 %d/%d 特征", symbol, len(stable_feats), n_feats)
     return result
 
 
 def get_causal_features(symbol: str = "BTC",
                         max_age: float = 86400 * 3) -> List[str]:
-    """获取缓存的因果筛选后特征列表。
+    """获取缓存的因果筛选后特征列表（按 symbol 分桶，默认 3 天 TTL）。
 
-    缓存 > max_age（默认 3 天）自动重跑。
+    缓存缺失 / 过旧（按该币条目 ts 计） → 自动重跑 discover(symbol)。
     任何异常 → 返回全量 FEATURE_NAMES（不卡管线）。
     """
     try:
-        if os.path.exists(_CACHE_FILE):
-            with open(_CACHE_FILE) as f:
-                data = json.load(f)
-            age = time.time() - os.path.getmtime(_CACHE_FILE)
-            if age < max_age and data.get("symbol") == symbol:
-                feats = data.get("features", [])
-                if feats:
-                    return feats
-        # 缓存过旧/缺失 → 跑发现
+        cache = _load_cache()
+        entry = cache.get(symbol)
+        if entry:
+            age = time.time() - float(entry.get("ts", 0))
+            if age < max_age and entry.get("features"):
+                return list(entry["features"])
+        # 缓存过旧/缺失 → 跑发现（结果写回分桶缓存）
         result = discover(symbol)
         feats = result.get("features", [])
         return feats if feats else list(FEATURE_NAMES)

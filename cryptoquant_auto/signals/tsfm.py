@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional, Tuple
 
 import numpy as np
@@ -290,13 +291,177 @@ def _numpy_kwargs(kw: dict) -> dict:
     return {k: v for k, v in kw.items() if k in {"lookback", "alpha", "ridge", "seed"}}
 
 
+def _onnx_kwargs(kw: dict) -> dict:
+    """OnnxTimeMoeForecaster 只理解这些参数;其它后端专属,降级时剥离。"""
+    return {k: v for k, v in kw.items() if k in {"model_path", "lookback", "alpha", "horizon"}}
+
+
+class OnnxTimeMoeForecaster(TSFMForecaster):
+    """ONNX Runtime 后端（路线图 A.TSFM 指定）：加载 Time-MoE small 等导出的 ONNX 权重，CPU 推理，4G 可跑。
+
+    I/O 契约（导出权重时须对齐）：
+      - 输入名 = sess.get_inputs()[0].name，形状 (1, lookback) float32
+        （最近 lookback 根 1h 对数收益，顺序与 history_cache 一致）
+      - 输出名 = sess.get_outputs()[0].name，形状 (1, horizon) float32（点预测）
+    区间沿用残差经验分位（与 SPCI 共形同语义）。缺失 onnxruntime / 权重 / 推理异常
+    → 构造或 forecast 抛错，由 make_tsfm 降级到 DistilledTSFM（numpy）。
+    """
+
+    name = "onnx_timemoe"
+
+    def __init__(self, model_path: str, lookback: int = 24, alpha: float = 0.10,
+                 horizon: int = 1):
+        try:
+            import onnxruntime as ort
+        except ImportError as e:
+            raise ImportError(
+                "onnxruntime 未安装，TSFM 降级到 DistilledTSFM（numpy）") from e
+        self._lookback = lookback
+        self._alpha = alpha
+        self._horizon = horizon
+        self._model_path = model_path
+        self._sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        self._in_name = self._sess.get_inputs()[0].name
+        self._out_name = self._sess.get_outputs()[0].name
+        self._q_lo = -1e-3
+        self._q_hi = 1e-3
+
+    def fit(self, returns: np.ndarray) -> "OnnxTimeMoeForecaster":
+        r = np.asarray(returns, float)
+        if len(r) >= 2:
+            resid = r - np.roll(r, 1)
+            resid = resid[1:]
+            self._q_lo = float(np.quantile(resid, self._alpha / 2))
+            self._q_hi = float(np.quantile(resid, 1 - self._alpha / 2))
+        return self
+
+    def forecast(self, recent: np.ndarray, horizon: int = None
+                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        horizon = horizon or self._horizon
+        r = np.asarray(recent, float)[-self._lookback:]
+        if len(r) < self._lookback:
+            r = np.pad(r, (self._lookback - len(r), 0), constant_values=0.0)
+        x = r.reshape(1, self._lookback).astype(np.float32)
+        out = self._sess.run([self._out_name], {self._in_name: x})[0]
+        point = np.asarray(out, dtype=float).ravel()[:horizon]
+        scale = np.sqrt(np.arange(1, horizon + 1))
+        lo = point + self._q_lo * scale
+        hi = point + self._q_hi * scale
+        return point, lo, hi
+
+
+class ChronosBoltForecaster(TSFMForecaster):
+    """Chronos-Bolt 预训练时序基础模型（零样本 + 原生多分位）。
+
+    主后端：amazon/chronos-bolt-tiny（9M），CPU 推理极轻；原生 quantile 输出，
+    与 risk/conformal.SPCI 共形天然互补。惰性 import chronos（缺失即降级 numpy）。
+
+    Notes
+    -----
+    ChronosBoltPipeline predict 输出形状 (batch, 9, pred_length)，其中 9 个分位
+    为 [0.1..0.9]。本类取 index=0(0.1) 为 lower，index=4(0.5) 为 point，
+    index=8(0.9) 为 upper。若 alpha<0.2，区间比标称更宽（保守）。
+    """
+
+    name = "chronos_bolt"
+
+    def __init__(self, lookback: int = 64, horizon: int = 12,
+                 model: str = "amazon/chronos-bolt-tiny",
+                 alpha: float = 0.10, cache_dir: str = "data/tsfm_cache"):
+        self._lookback = lookback
+        self._horizon = horizon
+        self._model_id = model
+        self._alpha = alpha
+        self._cache_dir = cache_dir
+        self._pipeline = None
+
+    def _ensure(self):
+        if self._pipeline is None:
+            try:
+                from chronos import ChronosBoltPipeline
+            except ImportError as e:
+                raise ImportError("chronos-forecasting 未安装，TSFM 降级 numpy") from e
+            self._pipeline = ChronosBoltPipeline.from_pretrained(
+                self._model_id, device_map="cpu")
+
+    def fit(self, returns: np.ndarray) -> "ChronosBoltForecaster":
+        self._returns = np.asarray(returns, float)
+        return self
+
+    def forecast(self, recent: np.ndarray, horizon: int = None
+                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        self._ensure()
+        h = int(horizon or self._horizon)
+        import torch
+        ctx = np.asarray(recent, float)[-self._lookback:]
+        inp = torch.tensor(ctx.reshape(1, -1), dtype=torch.float32)
+        pred = self._pipeline.predict(inputs=inp, prediction_length=h)
+        # pred shape (1, 9, h); dim1 = quantile levels [0.1..0.9]
+        pr = np.asarray(pred, dtype=float)[0]  # (9, h)
+        point = pr[4, :]    # 0.5 quantile
+        lo = pr[0, :]       # 0.1 quantile
+        hi = pr[8, :]       # 0.9 quantile
+        return point, lo, hi
+
+
+class TimesFMForecaster(TSFMForecaster):
+    """TimesFM 2.5 预训练时序基础模型（零样本 + 原生连续分位头）。
+
+    精度档后端：google/timesfm-2.5-200m-pytorch（200M）。惰性 import timesfm+torch，
+    缺失即降级。原生 quantile_forecast（mean + 10th..90th），与 SPCI 互补。
+    """
+
+    name = "timesfm_2p5"
+
+    def __init__(self, lookback: int = 512, horizon: int = 12,
+                 model: str = "google/timesfm-2.5-200m-pytorch",
+                 alpha: float = 0.10, cache_dir: str = "data/tsfm_cache"):
+        self._lookback = lookback
+        self._horizon = horizon
+        self._model_id = model
+        self._alpha = alpha
+        self._cache_dir = cache_dir
+        self._model = None
+
+    def _ensure(self):
+        if self._model is None:
+            try:
+                import timesfm
+            except ImportError as e:
+                raise ImportError("timesfm 未安装，TSFM 降级 numpy") from e
+            self._model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
+                self._model_id, torch_compile=True)
+            self._model.compile(timesfm.ForecastConfig(
+                max_context=1024, max_horizon=256,
+                normalize_inputs=True, use_continuous_quantile_head=True,
+                force_flip_invariance=True, infer_is_positive=True,
+                fix_quantile_crossing=True))
+
+    def fit(self, returns: np.ndarray) -> "TimesFMForecaster":
+        self._returns = np.asarray(returns, float)
+        return self
+
+    def forecast(self, recent: np.ndarray, horizon: int = None
+                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        self._ensure()
+        h = int(horizon or self._horizon)
+        inp = np.asarray(recent, float)[-self._lookback:].tolist()
+        point_fc, qf = self._model.forecast(horizon=h, inputs=[inp])
+        # point_fc: (1, h); qf: (1, h, 10) = [mean, 0.1 .. 0.9]
+        point = np.asarray(point_fc, float)[0]
+        qf = np.asarray(qf, float)[0]  # (h, 10)
+        lo = qf[:, 1]   # 0.1
+        hi = qf[:, 9]   # 0.9
+        return point, lo, hi
+
+
 def make_tsfm(backend: str = "auto", **kw) -> TSFMForecaster:
     """统一入口：auto 优先 torch，缺失/失败 → numpy 降级（纪律：torch 可选 + 降级）。
 
     backend='pretrained'：返回真实权重骨架；权重加载须在生产服务器执行，
     加载失败/缺失时由调用方降级到 numpy（见 run_validation_stage4 的 A/B 降级逻辑）。
     """
-    if backend == "numpy":
+    if backend in ("numpy", "distilled"):
         return DistilledTSFM(**_numpy_kwargs(kw))
     if backend == "torch":
         try:
@@ -308,7 +473,31 @@ def make_tsfm(backend: str = "auto", **kw) -> TSFMForecaster:
             return PretrainedTSFM(**kw)
         except Exception:
             return DistilledTSFM(**_numpy_kwargs(kw))   # 降级路径
-    # auto
+    if backend == "onnx":
+        try:
+            return OnnxTimeMoeForecaster(**_onnx_kwargs(kw))
+        except Exception:
+            return DistilledTSFM(**_numpy_kwargs(kw))   # 降级路径
+    if backend == "chronos":
+        try:
+            return ChronosBoltForecaster(**kw)
+        except Exception:
+            return DistilledTSFM(**_numpy_kwargs(kw))   # 降级路径
+    if backend == "timesfm":
+        try:
+            return TimesFMForecaster(**kw)
+        except Exception:
+            return DistilledTSFM(**_numpy_kwargs(kw))   # 降级路径
+    # auto：chronos(主) → timesfm(精度档) → torch → numpy，逐级降级
+    try:
+        return ChronosBoltForecaster(**kw)
+    except Exception:
+        pass
+    try:
+        return TimesFMForecaster(**kw)
+    except Exception:
+        pass
+    # 否则 torch → numpy
     try:
         return TorchTSFM(**kw)
     except ImportError:

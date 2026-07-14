@@ -38,16 +38,36 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
+# 被因果发现剔除的特征 → 中性默认值（数值上「不贡献信号」，而不是 KeyError）。
+# 语义：某特征未通过 Granger 稳定性筛选，就让它对议会数值逻辑保持中性，
+# 从而真正降低噪声、聚焦因果特征，而非粗暴删列导致索引越界。
+_FEATURE_DEFAULTS = {
+    "adx": 0.0, "rsi": 0.0, "atr_pct": 0.0, "vol_regime": 0.0,
+    "fr": 0.0, "fr_delta": 0.0, "oi_pct": 0.0, "fng": 0.5, "momentum": 0.0,
+}
+
+
+def _fget(feat, name: str, active, default: Optional[float] = None) -> float:
+    """安全读取特征：name 在被激活集合内 → 取真实值；否则返回中性默认值。
+
+    active 为「本次议会生效的特征名集合」（因果发现筛选后的子集）。
+    """
+    if name in active:
+        return float(feat[_IDX[name]])
+    return _FEATURE_DEFAULTS.get(name, default if default is not None else 0.0)
+
+
 # ============================ ① Analyst ============================
 class Analyst:
     """读特征 + 工作记忆 → 市场态 + 驱动 + 初步信念。"""
 
     def assess(self, symbol: str, feat: np.ndarray, regime: str,
-               profile) -> Dict:
-        adx = float(feat[_IDX["adx"]])
-        mom = float(feat[_IDX["momentum"]])
-        fng = float(feat[_IDX["fng"]])
-        vreg = float(feat[_IDX["vol_regime"]])   # +1 扩张 / -1 收敛
+               profile, active=None, forecast=None) -> Dict:
+        active = active or set(FEATURE_NAMES)
+        adx = _fget(feat, "adx", active)
+        mom = _fget(feat, "momentum", active)
+        fng = _fget(feat, "fng", active)
+        vreg = _fget(feat, "vol_regime", active)   # +1 扩张 / -1 收敛
 
         # 市场态：regime + 动量 + 恐慌贪婪 三角投票
         if regime == "CRASH":
@@ -72,7 +92,8 @@ class Analyst:
             f"vol_regime={vreg:+.0f}", f"regime={regime}",
         ]
         return {"market_state": state, "conviction": conv, "drivers": drivers,
-                "adx": adx, "momentum": mom, "fng": fng, "vol_regime": vreg}
+                "adx": adx, "momentum": mom, "fng": fng, "vol_regime": vreg,
+                "forecast": forecast}
 
 
 # ============================ ② Researcher ============================
@@ -80,11 +101,13 @@ class Researcher:
     """从 FinMem 检索长期洞察，做支持/反对辩论并调置信。"""
 
     def debate(self, symbol: str, feat: np.ndarray, regime: str,
-               analyst_out: Dict, memory: FinMemMemory) -> Dict:
+               analyst_out: Dict, memory: FinMemMemory, active=None,
+               forecast=None) -> Dict:
+        active = active or set(FEATURE_NAMES)
         mom = analyst_out["momentum"]
         fng = analyst_out["fng"]
         vreg = analyst_out["vol_regime"]
-        fr = float(feat[_IDX["fr"]])
+        fr = _fget(feat, "fr", active)
 
         support: List[str] = []
         contra: List[str] = []
@@ -102,6 +125,10 @@ class Researcher:
             conf_adj -= 0.10
         if abs(fr) > 0.0005:
             contra.append(f"资金费率偏高({fr:+.4f})，持仓拥挤")
+            conf_adj -= 0.05
+        # TSFM 预报与动量背离 → 方向信号打架，不确定性上升
+        if forecast is not None and abs(forecast) > 1e-4 and mom * forecast < 0:
+            contra.append(f"TSFM 预报({forecast:+.4f})与动量背离，不确定性上升")
             conf_adj -= 0.05
 
         # 记忆面辩论：检索该 regime 的长期洞察
@@ -128,11 +155,19 @@ class DecisionMaker:
 
     def propose(self, symbol: str, feat: np.ndarray, regime: str,
                 analyst_out: Dict, researcher_out: Dict,
-                memory: FinMemMemory, spi_surprise: float = 0.0) -> LLMDecision:
+                memory: FinMemMemory, spi_surprise: float = 0.0,
+                forecast=None) -> LLMDecision:
         # 融合方向：动量 × 趋势强度
         lean = analyst_out["momentum"]
         if analyst_out["adx"] > 0.25:
             lean *= (1.0 + analyst_out["adx"])
+        # TSFM 预报作为第 10 路方向信号，与动量加权融合（无预报则退化为原行为）
+        base_extra = 0.0
+        if forecast is not None:
+            lean_fc = _clamp(forecast * 20.0, -1.0, 1.0)   # 对数收益同量级缩放
+            lean = 0.6 * lean + 0.4 * lean_fc
+            # 方向一致 → 置信微增；背离 → 微减（不确定性）
+            base_extra = 0.05 if analyst_out["momentum"] * forecast >= 0 else -0.05
         thr = 0.004
         if lean > thr:
             fused = LONG
@@ -141,8 +176,8 @@ class DecisionMaker:
         else:
             fused = HOLD
 
-        base_conf = _clamp(analyst_out["conviction"] + researcher_out["conf_adj"],
-                           0.0, 1.0)
+        base_conf = _clamp(analyst_out["conviction"] + researcher_out["conf_adj"]
+                           + base_extra, 0.0, 1.0)
         ctx = CouncilContext(
             symbol=symbol, regime=regime,
             market_state=analyst_out["market_state"],
@@ -230,11 +265,16 @@ class FourRoleCouncil:
 
     def decide(self, symbol: str, feat: np.ndarray, regime: str,
                spi_surprise: float = 0.0, record: bool = True,
-               conformal=None) -> CouncilVerdict:
-        a = self.analyst.assess(symbol, feat, regime, self.profile)
-        r = self.researcher.debate(symbol, feat, regime, a, self.memory)
+               conformal=None, feature_names=None, forecast=None) -> CouncilVerdict:
+        # feature_names：因果发现筛选后的生效特征子集；None → 全量（向后兼容）
+        # forecast：TSFM 单步点预测（log return），None → 不引入预报信号（向后兼容）
+        active = set(feature_names) if feature_names else set(FEATURE_NAMES)
+        a = self.analyst.assess(symbol, feat, regime, self.profile, active=active,
+                                forecast=forecast)
+        r = self.researcher.debate(symbol, feat, regime, a, self.memory, active=active,
+                                   forecast=forecast)
         dec = self.decider.propose(symbol, feat, regime, a, r, self.memory,
-                                    spi_surprise=spi_surprise)
+                                   spi_surprise=spi_surprise, forecast=forecast)
         # 初筛：先以 spi=0 跑一次风控门，得到本轮置信（供 conformal 评估）
         action, vetoes, conf = RiskController().guard(
             dec, self.profile, spi_surprise=0.0, regime=regime)

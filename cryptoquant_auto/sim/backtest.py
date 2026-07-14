@@ -187,3 +187,29 @@ def make_random_signals(n: int, seed: int = 1) -> List[Signal]:
                           rr=2.0, confidence=rnd.uniform(0.5, 0.9),
                           signal_id=f"bt{i}", atr=round(atr, 4)))
     return out
+
+
+def stocksim_backtest(signals: List[Signal], agent_kind: str = "llm",
+                     n_bars: int = 400, seed: int = 0,
+                     cfg: "BacktestConfig" = None, gate=None, kc=None) -> BacktestStats:
+    """StockSim 合成市场压力回测（蓝图 E.StockSim 集成）。
+
+    每个信号从其 entry 起，由 MarketSimulator（订单簿 + LLM/规则合成对手盘）生成
+    前向价格路径，灌入真实执行管线（四闸门→下单→状态机→SL→对账），按真实成本核算 PnL。
+    与 make_random_signals + 历史回放互补：对手盘是「会复现程式化事实」的合成市场，
+    用于压力测试策略在真实统计特征市场中的稳健性（对 LLM 合成对手盘成交）。
+
+    零依赖：make_market_agent("llm") 内部用 MockLLM 接地，无需真实 LLM/API。
+    """
+    from .stocksim import make_market_agent, MarketSimulator
+
+    bc = cfg or BacktestConfig()
+    bt = PaperBacktest(cfg=bc, gate=gate)
+    for i, sig in enumerate(signals):
+        tick = max(0.01, sig.entry * 1e-4)   # 跨币种合理价差（小价币不过大）
+        sim = MarketSimulator(mid=sig.entry,
+                              agent=make_market_agent(agent_kind, seed=seed + i),
+                              tick=tick)
+        path = sim.run(n_bars).prices
+        bt.run_signal(sig, path=path, seed=seed + i * 7, kc=kc)
+    return bt.stats()
