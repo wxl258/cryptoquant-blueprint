@@ -153,7 +153,12 @@ class BinanceTestnetAdapter(ExchangeAdapter):
                 self._open_position(o, ap)
                 self.fills.append(Fill(
                     o.coid, symbol, side, ap, fq, time.time()))
-        else:
+            else:
+                # 市价单已接受但尚未完全成交（测试网偶有延迟）
+                logger = __import__("logging").getLogger("cryptoquant.testnet")
+                logger.warning("[submit_market] %s %s orderId=%s status=%s fq=%s",
+                              symbol, side, data.get("orderId"),
+                              data.get("status", "?"), fq)
             # 非预期响应（典型：密钥错误 / 权限不足 / 参数越界）
             logger = __import__("logging").getLogger("cryptoquant.testnet")
             logger.warning("[submit_market] %s %s http=%d code=%s msg=%s",
