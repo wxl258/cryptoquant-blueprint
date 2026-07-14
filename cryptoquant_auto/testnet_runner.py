@@ -32,6 +32,20 @@ logger = logging.getLogger("cryptoquant.testnet")
 POS_SIZE_USDT = int(os.getenv("CRYPTOQUANT_POS_SIZE", "100"))   # 每币基柱 USDT
 LEVERAGE = int(os.getenv("CRYPTOQUANT_LEVERAGE", "2"))           # 杠杆倍数
 
+# 币安 USDT-M 合约 LOT_SIZE 步长（api/v1/exchangeInfo 可查，硬编码省一次 API 调用）
+_STEP_SIZES = {
+    "BTC": 0.001, "ETH": 0.01, "SOL": 0.1,
+    "BNB": 0.001, "XRP": 1.0, "TRX": 10.0,
+    "DOGE": 1.0, "ADA": 1.0, "AVAX": 0.01,
+    "LINK": 0.01, "TON": 0.1, "SUI": 0.1,
+}
+
+
+def _fmt_qty(symbol: str, qty: float) -> float:
+    """按步长向下取整，拒绝超精度错误（-1111）。"""
+    step = _STEP_SIZES.get(symbol, 0.001)
+    return float(int(qty / step) * step)
+
 PAPER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "paper")
 
 
@@ -136,7 +150,7 @@ def sync_positions(adapter: BinanceTestnetAdapter,
 
         # 开新仓
         open_side = "BUY" if action == "LONG" else "SELL"
-        qty = round(POS_SIZE_USDT * LEVERAGE / price, 6)
+        qty = _fmt_qty(sym, POS_SIZE_USDT * LEVERAGE / price)
         if qty < 0.001:
             logger.warning("  [testnet] %s qty=%s 过小跳过", sym, qty)
             continue
