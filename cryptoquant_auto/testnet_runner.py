@@ -71,6 +71,9 @@ def _fetch_prices(symbols: List[str]) -> Dict[str, float]:
 def _calc_pnl(adapter: BinanceTestnetAdapter) -> dict:
     """汇总测试网 P&L。"""
     fills = getattr(adapter, "fills", [])
+    logger.info("[debug]  fills=%d positions=%d balance_wallet=%s",
+                len(fills), len(adapter.query_positions()),
+                "" if not hasattr(adapter, '_client') else '?')
     realized = sum(f.price * f.qty * (1 if f.side == "SELL" else -1)
                    for f in fills) * -1  # 简算（未计手续费）
     positions = adapter.query_positions()
