@@ -10,6 +10,13 @@
   - 设环境变量 CRYPTOQUANT_LLM_KEY（密钥走 env/Secret Manager，禁止硬编码）
   - 沙箱无外网 + 真实 LLM 被禁：RealLLM 无法在沙箱实例化/调用
 
+供应商切换（均 OpenAI 兼容 chat-completions + Function Calling 锁表）：
+  - 默认（不设）指向 OpenAI 官方，模型 gpt-4o-mini
+  - DeepSeek：设 CRYPTOQUANT_LLM_BASE_URL=https://api.deepseek.com
+                  CRYPTOQUANT_LLM_MODEL=deepseek-chat   （V3，支持 tools）
+              ⚠️ 勿用 deepseek-reasoner(R1)：其 API 不吐 tool_calls，会触发 fail-closed 降级为 Mock
+  - 其他 OpenAI 兼容端点同理，仅改 base_url / model 两个环境变量，零改代码
+
 降级纪律：调用失败（超时/拒答/越界）默认降级为 MockLLM 填表（fail-closed，不阻塞管线）；
 设 degrade_on_error=False 可改为硬失败（上线初期暴露问题用）。
 """
@@ -108,15 +115,21 @@ def get_llm(degrade_on_error: bool = True):
     """零配置工厂（小白友好）：
 
     - 设了 CRYPTOQUANT_LLM_KEY 且 openai 可用 → 返回 RealLLM（真 LLM）
+    - 可选环境变量切换 OpenAI 兼容供应商（如 DeepSeek）：
+        CRYPTOQUANT_LLM_BASE_URL  e.g. https://api.deepseek.com（不设→OpenAI 官方）
+        CRYPTOQUANT_LLM_MODEL     e.g. deepseek-chat（不设→gpt-4o-mini）
     - 没设密钥 / 缺 openai / 任何异常 → 返回 MockLLM（确定性接地 mock）
 
     调用方（四角色决策）无需判断，直接 get_llm().produce(ctx)。
-    生产服务器设了密钥就自动用真 LLM，沙箱/没密钥自动降级，零改代码。
+    生产服务器设了密钥+base_url 就自动用对应真 LLM，沙箱/没密钥自动降级，零改代码。
     """
     try:
-        if not os.getenv("CRYPTOQUANT_LLM_KEY"):
+        key = os.getenv("CRYPTOQUANT_LLM_KEY")
+        if not key:
             return MockLLM()
-        return RealLLM(degrade_on_error=degrade_on_error)
+        base_url = os.getenv("CRYPTOQUANT_LLM_BASE_URL") or None
+        model = os.getenv("CRYPTOQUANT_LLM_MODEL") or "gpt-4o-mini"
+        return RealLLM(model=model, base_url=base_url, degrade_on_error=degrade_on_error)
     except Exception as e:
         logger.warning("RealLLM 初始化失败，回退 MockLLM：%s", e)
         return MockLLM()
