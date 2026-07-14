@@ -125,17 +125,24 @@ class BinanceTestnetAdapter(ExchangeAdapter):
 
     # ---- 成交（价格穿越检测；生产改 user data stream）----
     def submit_market(self, symbol: str, side: str, qty: float,
-                      signal_id: str = "") -> dict:
+                      signal_id: str = "", price: float = 0) -> dict:
         """市价入场单（测试网即刻成交，绕过 LIMIT-only submit 路径）。
 
         参数同 Binance /fapi/v1/order：symbol（如 BTC）, side（BUY/SELL）, qty。
+        若传 price 则使用 LIMIT 激进限价(测试网 MARKET 常驻 NEW 不成交)。
         返回测试网 API 原始 JSON；同时更新内部 position/fills 跟踪。
         """
         if self.constitution.live_capital:
             return {"status": "REJECTED", "reason": "live_capital=True 禁止下单"}
-        params = {"symbol": self._sym(symbol), "side": side,
-                  "quantity": round(qty, 6), "type": "MARKET",
-                  "newClientOrderId": f"mkt_{symbol}_{side}_{int(time.time())}"}
+        if price and price > 0:
+            params = {"symbol": self._sym(symbol), "side": side,
+                      "quantity": round(qty, 6), "type": "LIMIT",
+                      "price": f"{price:.2f}", "timeInForce": "GTC",
+                      "newClientOrderId": f"mkt_{symbol}_{side}_{int(time.time())}"}
+        else:
+            params = {"symbol": self._sym(symbol), "side": side,
+                      "quantity": round(qty, 6), "type": "MARKET",
+                      "newClientOrderId": f"mkt_{symbol}_{side}_{int(time.time())}"}
         r = self.sess.post(BASE + "/fapi/v1/order", params=self._sign(params),
                            timeout=self._timeout)
         data = r.json()
@@ -182,7 +189,7 @@ class BinanceTestnetAdapter(ExchangeAdapter):
                             o = Order(
                                 coid=od.get("clientOrderId",""), symbol=symbol,
                                 side=side, otype=OrderType.ENTRY,
-                                price=ap2, qty=fq2)
+                                price=ap2, qty=fq2, signal_id=signal_id)
                             o.filled_qty = fq2; o.filled_price = ap2
                             o.status = OrderStatus.FILLED
                             self._open_position(o, ap2)

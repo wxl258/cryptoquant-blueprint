@@ -132,7 +132,9 @@ def sync_positions(adapter: BinanceTestnetAdapter,
                 side = "SELL" if cur_dir == "LONG" else "BUY"
                 qty = round(abs(cur.qty), 6)
                 if qty > 0:
-                    resp = adapter.submit_market(sym, side, qty)
+                    # 平仓用激进限价确保成交：市价的 0.5% 让步
+                    limit_price = round(price * 1.005 if side == "BUY" else price * 0.995, 2)
+                    resp = adapter.submit_market(sym, side, qty, price=limit_price)
                     trades.append({"symbol": sym, "action": "CLOSE",
                                    "side": side, "qty": qty,
                                    "resp": resp.get("status", "?")})
@@ -143,22 +145,25 @@ def sync_positions(adapter: BinanceTestnetAdapter,
         if cur_dir == action:
             continue
 
-        # 信号反转 → 平旧仓
+        # 信号反转 → 平旧仓（也用激进限价）
         if cur_dir:
             close_side = "SELL" if cur_dir == "LONG" else "BUY"
             qty = round(abs(cur.qty), 6)
             if qty > 0:
-                adapter.submit_market(sym, close_side, qty)
+                limit_price = round(price * 1.005 if close_side == "BUY" else price * 0.995, 2)
+                adapter.submit_market(sym, close_side, qty, price=limit_price)
                 trades.append({"symbol": sym, "action": "CLOSE",
                                "side": close_side, "qty": qty})
 
-        # 开新仓
+        # 开新仓（用激进 LIMIT 替代 MARKET 解决测试网不成交）
         open_side = "BUY" if action == "LONG" else "SELL"
         qty = _fmt_qty(sym, POS_SIZE_USDT * LEVERAGE / price)
         if qty < 0.001:
             logger.warning("  [testnet] %s qty=%s 过小跳过", sym, qty)
             continue
-        resp = adapter.submit_market(sym, open_side, qty, signal_id=f"sig_{sym}")
+        limit_price = round(price * 1.005 if open_side == "BUY" else price * 0.995, 2)
+        resp = adapter.submit_market(sym, open_side, qty,
+                                     signal_id=f"sig_{sym}", price=limit_price)
         trades.append({"symbol": sym, "action": f"OPEN_{action}",
                        "side": open_side, "qty": qty,
                        "resp": resp.get("status", "?")})
