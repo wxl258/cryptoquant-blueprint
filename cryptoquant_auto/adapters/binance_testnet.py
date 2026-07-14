@@ -50,10 +50,13 @@ class BinanceTestnetAdapter(ExchangeAdapter):
     def _sign(self, params: dict) -> dict:
         params["recvWindow"] = self.recv
         params["timestamp"] = int(time.time() * 1000)
-        q = urllib.parse.urlencode(params)
-        params["signature"] = hmac.new(self.sec.encode(), q.encode(),
-                                       hashlib.sha256).hexdigest()
-        return params
+        # Binance USDT-M 合约要求参数按字母序排序后做 HMAC 签名
+        sorted_pairs = sorted(params.items(), key=lambda kv: kv[0])
+        q = urllib.parse.urlencode(sorted_pairs)
+        sig = hmac.new(self.sec.encode(), q.encode(),
+                       hashlib.sha256).hexdigest()
+        sorted_pairs.append(("signature", sig))
+        return dict(sorted_pairs)
 
     @staticmethod
     def _sym(s: str) -> str:
