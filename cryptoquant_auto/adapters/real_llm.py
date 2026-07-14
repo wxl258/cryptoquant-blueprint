@@ -118,12 +118,12 @@ class RealLLM:
             "retrieved_insights": ctx.retrieved_insights,
             "spi_surprise": round(float(ctx.spi_surprise), 3),
         }
-        extra: dict = {}
         # DeepSeek V4/V4-Flash 默认启用思考模式，但思考模式下不支持强制 tool_choice
         # （本系统 lock-table 依赖 tool_choice 锁定 emit_trade_decision）。
-        # 显式禁用思考模式使工具锁表正常；不向非 DeepSeek（OpenAI 等）传此参数。
+        # 显式禁用思考模式使工具锁表正常；用 extra_body 透传以避免 openai SDK 参数校验拦截。
+        extra_body: Optional[dict] = None
         if self.base_url and "deepseek" in self.base_url:
-            extra["thinking"] = {"type": "disabled"}
+            extra_body = {"thinking": {"type": "disabled"}}
         resp = self._client.chat.completions.create(
             model=self.model,
             messages=[
@@ -134,7 +134,7 @@ class RealLLM:
             tool_choice={"type": "function",
                          "function": {"name": "emit_trade_decision"}},
             temperature=0.0,
-            **extra,
+            extra_body=extra_body,
         )
         msg = resp.choices[0].message
         args = None
