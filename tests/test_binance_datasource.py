@@ -95,6 +95,29 @@ def test_funding_rate_and_oi_parsed(patched):
     assert feat["oi_pct"] == pytest.approx(0.1, rel=1e-6)
 
 
-def test_symbols_and_failsoft(patched):
-    # symbols 列表完整
-    assert len(patched.symbols()) == 12
+def test_symbols_default_is_six(patched):
+    # 默认币种集为 6 币（与 history_cache.json 缓存一致）
+    assert patched.symbols() == ["BTC", "ETH", "SOL", "BNB", "XRP", "TRX"]
+
+
+def test_symbols_env_override_expands(monkeypatch):
+    # CRYPTOQUANT_SYMBOLS 可扩到 12 币
+    monkeypatch.setenv(
+        "CRYPTOQUANT_SYMBOLS",
+        "BTC,ETH,SOL,BNB,XRP,TRX,DOGE,ADA,AVAX,LINK,TON,SUI")
+    ds = BinancePublicDataSource(warmup=240, limit=500)
+    assert len(ds.symbols()) == 12
+    assert "DOGE" in ds.symbols()
+
+
+def test_get_symbols_default(monkeypatch):
+    monkeypatch.delenv("CRYPTOQUANT_SYMBOLS", raising=False)
+    from cryptoquant_auto.history import get_symbols
+    assert get_symbols() == ["BTC", "ETH", "SOL", "BNB", "XRP", "TRX"]
+
+
+def test_get_symbols_env_separators(monkeypatch):
+    # 支持逗号/分号分隔、空格、大小写归一
+    monkeypatch.setenv("CRYPTOQUANT_SYMBOLS", "btc; eth, SOL")
+    from cryptoquant_auto.history import get_symbols
+    assert get_symbols() == ["BTC", "ETH", "SOL"]

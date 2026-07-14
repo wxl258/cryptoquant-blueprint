@@ -21,6 +21,20 @@ GATE = "https://api.gateio.ws/api/v4/futures/usdt"
 FNG = "https://api.alternative.me/fng/"
 SYMBOLS = ["BTC", "ETH", "SOL", "BNB", "XRP", "TRX"]
 CONTRACT = {s: f"{s}_USDT" for s in SYMBOLS}
+
+
+def get_symbols() -> List[str]:
+    """统一币种集（live/history 共用），可被环境变量 CRYPTOQUANT_SYMBOLS 覆盖。
+
+    默认 6 币（与 history_cache.json 缓存一致）。设 CRYPTOQUANT_SYMBOLS 可扩到 12，例如：
+      CRYPTOQUANT_SYMBOLS="BTC,ETH,SOL,BNB,XRP,TRX,DOGE,ADA,AVAX,LINK,TON,SUI"
+    """
+    env = os.getenv("CRYPTOQUANT_SYMBOLS")
+    if env:
+        vals = [s.strip().upper() for s in env.replace(";", ",").split(",") if s.strip()]
+        if vals:
+            return vals
+    return list(SYMBOLS)
 # P2-6 修复：缓存路径改为包内相对路径，避免硬编码 /workspace 导致落点错位、刷新不生效
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history_cache.json")
 

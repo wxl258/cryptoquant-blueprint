@@ -42,6 +42,7 @@ LIVE_CAPITAL = False
 from .stage2_features import (
     assemble_feature, FEATURE_NAMES, _load_history, _load_deriv,
 )
+from .history import get_symbols
 from .meta.agents import FourRoleCouncil, LONG, SHORT, HOLD
 from .meta.memory import FinMemMemory
 from .adapters.real_llm import get_llm, RealLLM
@@ -140,10 +141,9 @@ class GateioPublicDataSource(DataSource):
 
     BASE = "https://api.gateio.ws/api/v4/futures/usdt"
     FNG = "https://api.alternative.me/fng/?limit=1"
-    SYMBOLS = ["BTC", "ETH", "SOL", "BNB", "XRP", "TRX",
-               "DOGE", "ADA", "AVAX", "LINK", "TON", "SUI"]
-
     def __init__(self, warmup: int = 240, limit: int = 500):
+        # 币种集统一走 get_symbols()（默认 6 币，CRYPTOQUANT_SYMBOLS 可扩到 12）
+        self.SYMBOLS = get_symbols()
         self.warmup = warmup
         self.limit = limit
         self._fng = 50.0
@@ -226,10 +226,9 @@ class BinancePublicDataSource(DataSource):
     BASE = "https://fapi.binance.com/fapi/v1"
     OI_BASE = "https://fapi.binance.com/futures/data"
     FNG = "https://api.alternative.me/fng/?limit=1"
-    SYMBOLS = ["BTC", "ETH", "SOL", "BNB", "XRP", "TRX",
-               "DOGE", "ADA", "AVAX", "LINK", "TON", "SUI"]
-
     def __init__(self, warmup: int = 240, limit: int = 500):
+        # 币种集统一走 get_symbols()（默认 6 币，CRYPTOQUANT_SYMBOLS 可扩到 12）
+        self.SYMBOLS = get_symbols()
         self.warmup = warmup
         self.limit = limit
         self._fng = 50.0
