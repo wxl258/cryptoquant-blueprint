@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -35,7 +36,7 @@ LEVERAGE = int(os.getenv("CRYPTOQUANT_LEVERAGE", "2"))           # 杠杆倍数
 # 币安 USDT-M 合约 LOT_SIZE 步长（api/v1/exchangeInfo 可查，硬编码省一次 API 调用）
 _STEP_SIZES = {
     "BTC": 0.001, "ETH": 0.01, "SOL": 0.1,
-    "BNB": 0.001, "XRP": 1.0, "TRX": 10.0,
+    "BNB": 0.01, "XRP": 1.0, "TRX": 10.0,
     "DOGE": 1.0, "ADA": 1.0, "AVAX": 0.01,
     "LINK": 0.01, "TON": 0.1, "SUI": 0.1,
 }
@@ -44,7 +45,10 @@ _STEP_SIZES = {
 def _fmt_qty(symbol: str, qty: float) -> float:
     """按步长向下取整，拒绝超精度错误（-1111）。"""
     step = _STEP_SIZES.get(symbol, 0.001)
-    return float(int(qty / step) * step)
+    adjusted = int(qty / step) * step
+    # 根据 step 的小数位数精确截断浮点噪声
+    precision = max(0, -int(math.floor(math.log10(step))))
+    return round(adjusted, precision)
 
 PAPER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "paper")
 

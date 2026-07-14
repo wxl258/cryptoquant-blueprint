@@ -165,6 +165,33 @@ class BinanceTestnetAdapter(ExchangeAdapter):
                 logger.warning("[submit_market] %s %s PENDING orderId=%s "
                               "status=%s fq=%s", symbol, side,
                               data.get("orderId"), data.get("status", "?"), fq)
+                # 等 1.5s 后查一次订单状态看是否已成交
+                __import__("time").sleep(1.5)
+                oid = data.get("orderId")
+                try:
+                    qp = self.sess.get(
+                        BASE + "/fapi/v1/order",
+                        params=self._sign({"symbol": self._sym(symbol),
+                                           "orderId": oid}),
+                        timeout=self._timeout)
+                    od = qp.json()
+                    if od.get("status") == "FILLED":
+                        fq2 = float(od.get("executedQty", 0))
+                        ap2 = float(od.get("avgPrice", od.get("price", 0)))
+                        if fq2 > 0:
+                            o = Order(
+                                coid=od.get("clientOrderId",""), symbol=symbol,
+                                side=side, otype=OrderType.ENTRY,
+                                price=ap2, qty=fq2)
+                            o.filled_qty = fq2; o.filled_price = ap2
+                            o.status = OrderStatus.FILLED
+                            self._open_position(o, ap2)
+                            self.fills.append(Fill(
+                                o.coid, symbol, side, ap2, fq2, time.time()))
+                            logger.info("[submit_market] %s %s FILLED(retry) "
+                                        "qty=%s price=%s", symbol, side, fq2, ap2)
+                except Exception as e:
+                    logger.warning("[submit_market] retry query %s: %s", oid, e)
         else:
             # 非预期响应（典型：密钥错误 / 权限不足 / 参数越界）
             logger = __import__("logging").getLogger("cryptoquant.testnet")
