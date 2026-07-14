@@ -121,6 +121,37 @@ class BinanceTestnetAdapter(ExchangeAdapter):
         return list(self.positions.values())
 
     # ---- 成交（价格穿越检测；生产改 user data stream）----
+    def submit_market(self, symbol: str, side: str, qty: float,
+                      signal_id: str = "") -> dict:
+        """市价入场单（测试网即刻成交，绕过 LIMIT-only submit 路径）。
+
+        参数同 Binance /fapi/v1/order：symbol（如 BTC）, side（BUY/SELL）, qty。
+        返回测试网 API 原始 JSON；同时更新内部 position/fills 跟踪。
+        """
+        if self.constitution.live_capital:
+            return {"status": "REJECTED", "reason": "live_capital=True 禁止下单"}
+        params = {"symbol": self._sym(symbol), "side": side,
+                  "quantity": round(qty, 6), "type": "MARKET",
+                  "newClientOrderId": f"mkt_{symbol}_{side}_{int(time.time())}"}
+        r = self.sess.post(BASE + "/fapi/v1/order", params=self._sign(params),
+                           timeout=self._timeout)
+        data = r.json()
+        if data.get("orderId"):
+            fq = float(data.get("executedQty", 0))
+            ap = float(data.get("avgPrice", data.get("price", 0)))
+            if fq > 0:
+                o = Order(
+                    coid=data.get("clientOrderId", ""), symbol=symbol,
+                    side=side, otype=OrderType.ENTRY,
+                    price=ap, qty=fq, signal_id=signal_id)
+                o.filled_qty = fq
+                o.filled_price = ap
+                o.status = OrderStatus.FILLED
+                self._open_position(o, ap)
+                self.fills.append(Fill(
+                    o.coid, symbol, side, ap, fq, time.time()))
+        return data
+
     def simulate_market(self, prices: dict) -> None:
         for coid, o in list(self.open_orders.items()):
             p = prices.get(o.symbol)
