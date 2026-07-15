@@ -442,6 +442,48 @@ def _acf1(x: np.ndarray) -> float:
     return float(np.corrcoef(x[:-1], x[1:])[0, 1])
 
 
+def _hurst_dfa(x: np.ndarray, min_window: int = 4, max_window: int = None) -> float:
+    """Detrended Fluctuation Analysis — 返回 Hurst 指数 H。
+
+    H ∈ (0.5, 1.0) → 长记忆（持久性）；H ≈ 0.5 → 白噪声；H < 0.5 → 反持久。
+    对非平稳趋势鲁棒，比 ACF 法更稳健。
+    """
+    x = np.asarray(x, float)
+    n = len(x)
+    if n < 16:
+        return 0.5
+    # 累积离差（积分）
+    y = np.cumsum(x - x.mean())
+    max_w = max_window or n // 4
+    # 生成窗口大小（对数等距）
+    ws = np.unique(np.logspace(np.log10(min_window), np.log10(max_w),
+                               num=min(30, max_w - min_window + 1), dtype=int))
+    ws = ws[(ws >= min_window) & (ws <= max_w)]
+    if len(ws) < 3:
+        return 0.5
+    fluct = np.zeros(len(ws))
+    for i, w in enumerate(ws):
+        n_seg = n // w
+        if n_seg < 2:
+            fluct[i] = 0.0
+            continue
+        fse = 0.0
+        for seg in range(n_seg):
+            idx = np.arange(seg * w, (seg + 1) * w)
+            if idx[-1] >= n:
+                break
+            poly = np.polyfit(idx, y[idx], 1)  # 线性去趋势
+            fit = np.polyval(poly, idx)
+            fse += np.sum((y[idx] - fit) ** 2)
+        fluct[i] = np.sqrt(fse / (n_seg * w))
+    # 过滤无效值
+    valid = (ws > 0) & (fluct > 0)
+    if valid.sum() < 3:
+        return 0.5
+    h = float(np.polyfit(np.log(ws[valid]), np.log(fluct[valid]), 1)[0])
+    return float(np.clip(h, 0.0, 1.5))
+
+
 def measure_stylized_facts(prices: List[float], volumes: List[float]
                            ) -> Dict[str, object]:
     """量化 StockSim 是否复现程式化事实（7 项检验）。"""
@@ -463,7 +505,8 @@ def measure_stylized_facts(prices: List[float], volumes: List[float]
     leverage_corr = float(np.corrcoef(rets[:-1], abs_rets[1:])[0, 1]) if n > 5 else 0.0
     # 5) 量-波交叉相关：corr(volₜ, |retₜ₊₁|) > 0
     vol_vol_corr = float(np.corrcoef(vols[:n - 1], abs_rets[1:])[0, 1]) if n > 5 and max(vols) > 0 else 0.0
-    # 6) 波动率长记忆：|收益| 滞后 5/10 自相关仍为正（幂律衰减）
+    # 6) 波动率长记忆：DFA Hurst 指数 + |收益| 滞后 5/10 自相关
+    hurst = _hurst_dfa(abs_rets)
     vl5 = float(np.corrcoef(abs_rets[:-5], abs_rets[5:])[0, 1]) if n > 10 else 0.0
     vl10 = float(np.corrcoef(abs_rets[:-10], abs_rets[10:])[0, 1]) if n > 20 else 0.0
     # 7) 收益线性自相关：滞后1 应接近 0
@@ -475,7 +518,7 @@ def measure_stylized_facts(prices: List[float], volumes: List[float]
         "volume_autocorr": acf_vol > 0.05,
         "has_leverage": leverage_corr < 0.0,
         "has_vol_vol_corr": vol_vol_corr > 0.1,
-        "has_long_memory": vl5 > 0.1 and vl10 > 0.05,
+        "has_long_memory": hurst > 0.55 and vl5 > 0.1 and vl10 > 0.05,
         "has_no_linear_acf": abs(acf_ret1) < 0.05,
     }
     return {
@@ -485,6 +528,7 @@ def measure_stylized_facts(prices: List[float], volumes: List[float]
         "volume_acf1": round(acf_vol, 3),
         "leverage_corr": round(leverage_corr, 3),
         "vol_vol_corr": round(vol_vol_corr, 3),
+        "hurst": round(hurst, 3),
         "vol_acf5": round(vl5, 3),
         "vol_acf10": round(vl10, 3),
         "return_acf1": round(acf_ret1, 3),
