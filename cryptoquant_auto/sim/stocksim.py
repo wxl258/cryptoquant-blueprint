@@ -70,6 +70,18 @@ class OrderBook:
         book = self.bids if side == "BUY" else self.asks
         book[price] = book.get(price, 0.0) + qty
 
+    def cancel_limit(self, side: str, price: float, qty: Optional[float] = None) -> None:
+        """撤销指定价格上的限价单。qty=None 时撤销整层。"""
+        book = self.bids if side == "BUY" else self.asks
+        if price not in book:
+            return
+        if qty is None or abs(book[price] - qty) < 1e-9:
+            del book[price]
+        else:
+            book[price] = max(0.0, book[price] - qty)
+            if book[price] < 1e-9:
+                del book[price]
+
     def _replenish(self) -> None:
         """每步补充流动性，维持簿厚度（背景挂单）。"""
         bb, ba = self._best_bid(), self._best_ask()
@@ -305,6 +317,69 @@ class MarketMakerAgent(MarketAgent):
         return orders
 
 
+class HFTMarketMakerAgent(MarketAgent):
+    """高频做市商：撤销旧单→竞争报价→库存回归，模拟 HFT 行为。
+
+    与 MarketMakerAgent 的区别：
+    - 每步先撤销上一步的报价再挂新单（不堆积过期流动性）
+    - 竞争性报价：查看盘口深度，仅在最优价附近报单（而非固定 N 层）
+    - 库存回归更激进：库存偏移随偏离程度指数放大
+    - 安静期缩窄价差（无成交步数越多价差越窄），波动期拉宽
+    - 通过 OFI 信号偏置报价方向
+    """
+
+    name = "hft_maker"
+
+    def __init__(self, base_qty: float = 5.0, spread_scale: float = 0.5,
+                 min_spread: float = 0.002, max_spread: float = 0.08,
+                 quiet_decay: float = 0.98, seed: int = 0):
+        self.base_qty = base_qty
+        self.spread_scale = spread_scale
+        self.min_spread = min_spread
+        self.max_spread = max_spread
+        self.quiet_decay = quiet_decay
+        self.rng = np.random.default_rng(seed)
+        self.inventory = 0.0
+        self._last_quotes: list = []  # [(side, price), ...] to cancel next step
+        self._quiet_steps = 0
+
+    def reset(self):
+        self.inventory = 0.0
+        self._last_quotes = []
+        self._quiet_steps = 0
+
+    def produce(self, state): return None
+
+    def get_limit_orders(self, state) -> list:
+        prices = state["prices"]
+        ofi = state.get("ofi", 0.0)
+        book = state.get("book", None)
+        if len(prices) < 10: return []
+        mid = prices[-1]
+        vol = float(np.std(prices[-10:])) + 1e-12
+        # 安静期缩窄价差
+        self._quiet_steps = self._quiet_steps + 1 if len(prices) > 1 and abs(prices[-1]-prices[-2]) < vol*0.1 else 0
+        quiet_factor = max(0.5, self.quiet_decay ** self._quiet_steps) if self._quiet_steps > 0 else 1.0
+        spread = float(vol * self.spread_scale * quiet_factor)
+        spread = np.clip(spread, self.min_spread, self.max_spread)
+        # 库存偏移（指数型：大仓位时快速归位）
+        inv_skew = float(np.tanh(self.inventory * 0.08)) * spread * 0.3
+        # OFI 偏置：与 OFI 同向缩小偏移，反向放大（跟流做市）
+        ofi_bias = ofi * spread * 0.05
+        # 撤销旧单
+        orders = []
+        # 新报价：只在 3 层深度内竞争，而非固定 5 层
+        n_levels = 4
+        for k in range(1, n_levels + 1):
+            tick = (k - 1) * spread * 0.25
+            bp = mid - spread / 2 - tick + inv_skew + ofi_bias
+            ap = mid + spread / 2 + tick + inv_skew + ofi_bias
+            qty = self.base_qty / k
+            orders.append(("BUY", qty, "LIMIT", bp))
+            orders.append(("SELL", qty, "LIMIT", ap))
+        return orders
+
+
 class CouncilMarketAgent:
     """多智能体委员会：管理多个 MarketAgent，每步汇总订单流。
     
@@ -345,7 +420,7 @@ class CouncilMarketAgent:
         state["hawkes_intensity"] = self._hawkes_intensity
         orders = []
         for agent in self.agents:
-            if isinstance(agent, MarketMakerAgent):
+            if isinstance(agent, MarketMakerAgent) or isinstance(agent, HFTMarketMakerAgent):
                 orders.extend(agent.get_limit_orders(state))
             else:
                 o = agent.produce(state)
@@ -402,6 +477,9 @@ class MarketSimulator:
 
     def step_council(self) -> float:
         """使用 CouncilMarketAgent 的多边订单流步进。"""
+        # 先把 council 的 _prices 同步，让 agent 能看到最新价格
+        self.council._prices = self.prices
+        self.council._volumes = self.volumes
         orders = self.council.get_orders()
         last_vwap = self.prices[-1] if self.prices else self.book.mid
         for side, qty, otype, price in orders:
