@@ -34,6 +34,15 @@ logger = logging.getLogger("cryptoquant.testnet")
 
 # 配置参数（可通过环境变量覆盖）
 POS_SIZE_USDT = int(os.getenv("CRYPTOQUANT_POS_SIZE", "100"))   # 每币基柱名义 USDT（保证金基数）
+
+
+# === Option B: CVaR 动态仓位护栏（proposed_exposure 接入执行端） ===
+# 名义敞口由信号侧 CVaR proposed_exposure 推导；杠杆仅设保证金不回乘。
+SINGLE_CAP_PCT = float(os.getenv("CRYPTOQUANT_SINGLE_CAP_PCT", "0.12"))       # 单币名义敞口上限 12%
+PORTFOLIO_CAP_PCT = float(os.getenv("CRYPTOQUANT_PORTFOLIO_CAP_PCT", "1.0"))   # 组合名义敞口上限 100%
+MIN_NOTIONAL_USDT = float(os.getenv("CRYPTOQUANT_MIN_NOTIONAL", "5.0"))        # 最小名义敞口护栏 5U
+EPS_EXPOSURE = 1e-9    # 敞口比较极小值，避免浮点抖动
+DYNAMIC_SIZING = os.getenv("CRYPTOQUANT_DYNAMIC_SIZING", "1") in ("1", "true", "True", "yes", "on")
 LEVERAGE = int(os.getenv("CRYPTOQUANT_LEVERAGE", "2"))           # 目标杠杆倍数（会通过 API 通知币安）
 # 测试网账户权益（gate 单币/总仓比例 + KillSwitch 日亏比例的基准）。
 # 默认 5000 → 固定 200USDT 单币 ≈ 4% 对齐 SINGLE_CAP_PCT，使闸门阈值有意义。
@@ -99,6 +108,31 @@ def _calc_leverage(confidence: float, regime: str, ks_level) -> int:
     ks_mult = {0: 1.0, 0.5: 0.8, 1.0: 0.5, 2.0: 0.3, 3.0: 0.1}.get(ks_val, 1.0)
     raw = 10.0 * regime_mult * conf_mult * ks_mult
     return max(1, min(20, int(round(raw))))
+
+
+
+def _ks_mult(ks_level) -> float:
+    """KillSwitch 级别 -> 敞口缩放系数（与 _calc_leverage 同源）。"""
+    ks_val = ks_level.value if hasattr(ks_level, "value") else float(ks_level)
+    return {0: 1.0, 0.5: 0.8, 1.0: 0.5, 2.0: 0.3, 3.0: 0.1}.get(ks_val, 1.0)
+
+
+def _target_notional(sym: str, details: dict, ks_level, equity: float) -> float:
+    """Option B: 由 CVaR proposed_exposure 推导目标名义敞口（纯函数，可单测）。
+
+    名义敞口 = clamp(proposed_exposure * equity * _ks_mult(level), 0, SINGLE_CAP_PCT*equity)
+    - 杠杆不回乘：返回值为名义敞口，调用方直接 notional/price 算 qty；
+      杠杆仅经 adapter._ensure_leverage 设保证金占用（margin = notional/lev）。
+    - 单币护栏：不超过 SINGLE_CAP_PCT * equity。
+    """
+    if equity <= 0:
+        return 0.0
+    expo = float((details or {}).get("proposed_exposure", 0.0))
+    if expo <= 0:
+        return 0.0
+    cap_single = SINGLE_CAP_PCT * equity
+    raw = expo * equity * _ks_mult(ks_level)
+    return min(max(raw, 0.0), cap_single)
 
 
 def _load_paper_signals() -> tuple[Dict[str, str], Dict[str, dict]]:
@@ -372,6 +406,7 @@ def sync_positions(adapter: BinanceTestnetAdapter,
     positions_map = {p.symbol: p for p in adapter.query_positions()}
     open_map = {o.symbol: o for o in adapter.query_open()}
 
+    portfolio_used = 0.0    # 组合累计名义敞口累加器（Option B 护栏）
     for sym, action in signals.items():
         if sym not in prices or not prices[sym]:
             continue
@@ -438,7 +473,23 @@ def sync_positions(adapter: BinanceTestnetAdapter,
         if open_dir == action:
             logger.info("  [testnet] %s 已有同方向挂单, 跳过开仓", sym)
             continue
-        qty = _fmt_qty(sym, POS_SIZE_USDT * lev / price)
+        # === Option B: CVaR 动态仓位（proposed_exposure 定名义敞口，杠杆不回乘） ===
+        if DYNAMIC_SIZING and float((dd or {}).get("proposed_exposure", 0.0)) > EPS_EXPOSURE:
+            notional = _target_notional(sym, dd, kill_switch.level, EQUITY_USDT)
+            # 组合护栏：剩余可分配名义敞口
+            remaining = PORTFOLIO_CAP_PCT * EQUITY_USDT - portfolio_used
+            notional = min(notional, max(0.0, remaining))
+            if notional >= MIN_NOTIONAL_USDT:
+                qty = _fmt_qty(sym, notional / price)   # 杠杆不回乘
+                portfolio_used += notional
+                logger.info("  [dynamic] %s 目标名义=%.2fU 杠杆=%dx 组合累计=%.2fU",
+                            sym, notional, lev, portfolio_used)
+            else:
+                logger.info("  [testnet] %s 组合护栏耗尽/低于最小护栏, 跳过开仓", sym)
+                continue
+        else:
+            # 无 CVaR 建议或动态关闭 -> 回退旧路径（POS_SIZE x lev）
+            qty = _fmt_qty(sym, POS_SIZE_USDT * lev / price)
         if qty < 0.001:
             logger.warning("  [testnet] %s qty=%s 过小跳过", sym, qty)
             continue
