@@ -137,7 +137,12 @@ def fetch_funding(contract: str) -> float:
 
 
 def fetch_fng(limit: int = 0) -> Dict[int, int]:
-    """Alternative.me 恐慌贪婪 -> {unix_day: value}。"""
+    """Alternative.me 恐慌贪婪 -> {unix_day: value}。
+
+    【P2-3】键统一 floor 到 00:00 UTC（发布时刻边界对齐）：任意时间戳 // 86400 * 86400
+    归到当日 UTC 午夜，与 gen_real_signals 中 day = ti // 86400 * 86400 同口径，
+    避免 FNG 返回非午夜时间戳时与信号日错位。
+    """
     try:
         data = _get_json(f"{FNG}?limit={limit}")
     except Exception:

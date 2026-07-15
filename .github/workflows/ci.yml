@@ -12,7 +12,7 @@ on:
 jobs:
   regression:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,22 +25,26 @@ jobs:
       - name: Install deps
         run: pip install --upgrade pip pytest numpy
 
-      - name: Pytest suite (63 项)
+      - name: Pytest suite (tests/)
         run: python -m pytest tests/ -q
-
-      - name: Pytest suite — package (cryptoquant_auto/)
-        # 【P0-6】覆盖包内自带测试（含 test_testnet_receipt 风控接线、test_testnet_pnl
-        # 浮盈回归），与 tests/ 互为冗余校验，任一 ❌ 即失败、拦住合并/部署。
-        run: python -m pytest cryptoquant_auto/ -q
 
       - name: P1 fix verification (12 项)
         run: python verify_p1_fixes.py
 
-      - name: Validation stage4
-        run: python -m cryptoquant_auto.run_validation_stage4
+      - name: Coverage gate (engine)
+        # 【P2-5】覆盖率门禁：统计 cryptoquant_auto 生产引擎覆盖率（demo / run_validation
+        # / 测试文件已在 .coveragerc 排除）。低于阈值即失败，拦住覆盖率塌方式回退。
+        # 阈值在首次 CI 跑出真实数字后校准（见下方 --cov-fail-under）。
+        run: |
+          pip install pytest-cov
+          python -m pytest cryptoquant_auto tests -q --cov=cryptoquant_auto --cov-report=term-missing --cov-fail-under=40
 
-      - name: Validation stage3
-        run: python -m cryptoquant_auto.run_validation_stage3
+      - name: Validation stage4 (unified entry)
+        # 【P2-4】统一入口 --stage 派发，替代直接调 run_validation_stage4.main
+        run: python -m cryptoquant_auto.run_validation --stage 4
 
-      - name: Validation stage0.5
-        run: python -m cryptoquant_auto.run_validation_0_5
+      - name: Validation stage3 (unified entry)
+        run: python -m cryptoquant_auto.run_validation --stage 3
+
+      - name: Validation stage0.5 (unified entry)
+        run: python -m cryptoquant_auto.run_validation --stage 0.5

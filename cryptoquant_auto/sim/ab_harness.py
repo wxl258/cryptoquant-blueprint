@@ -136,7 +136,7 @@ class ABResult:
 
 def controlled_ab(returns_rule, returns_llm, n_trials: int = 1,
                   sr0: float = 0.0, alpha: float = 0.05,
-                  periods_per_year: int = 1) -> ABResult:
+                  periods_per_year: int = 1) -> ABResult:  # 【P2-5 锁】默认单 bar SR(=1)；年化 8760 会把边缘 per-bar edge 放大成假显著，勿改（见 test_ab_annualization_contract.py）
     """受控 A/B：同 universe 下 rule vs llm 收益流对比。
 
     returns_rule / returns_llm: 等长或近似等长的逐 bar 收益序列（numpy/列表）。

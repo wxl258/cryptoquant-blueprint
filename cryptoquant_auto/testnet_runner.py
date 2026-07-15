@@ -156,9 +156,18 @@ def _close_position(adapter: BinanceTestnetAdapter, sym: str,
     logger.info("  [testnet] %s 平仓 %s qty=%s", sym, side, qty)
 
 
+# 【P2-2】手续费：Binance USDT-M 吃单费率 0.0004（测试网同口径）。市价单为吃单。
+# 盈亏计入双边手续费，使仪表盘盈亏可信（此前忽略手续费，盈亏虚高）。
+FEE_RATE_TAKER = 0.0004
+
+
 def _calc_pnl(adapter: BinanceTestnetAdapter,
               prices: Optional[Dict[str, float]] = None) -> dict:
-    """汇总测试网 P&L；成交数与已实现盈亏跨 run 持久化（修复'累计'口径）。"""
+    """汇总测试网 P&L；成交数与已实现盈亏跨 run 持久化（修复'累计'口径）。
+
+    【P2-2】已实现盈亏扣双边手续费：realized = Σ(SELL proceeds) − Σ(BUY cost) − Σ(fee)。
+    未实现盈亏为毛 MTM（开仓费已在已实现的买入腿扣除），与行业惯例一致。
+    """
     if prices is None:
         prices = {}
     run_fills = getattr(adapter, "fills", [])
@@ -170,10 +179,19 @@ def _calc_pnl(adapter: BinanceTestnetAdapter,
     _save_fill_history(history)
     logger.info("[debug] run_fills=%d history=%d positions=%d",
                 len(run_fills), len(history), len(adapter.query_positions()))
-    # 【P0 符号修复】已实现 = Σ(SELL proceeds) − Σ(BUY cost)：SELL 正、BUY 负，末位不再取负。
-    # 与 _daily_realized_pnl 同口径；此前 -1 导致符号反，盈利显示为负、亏损显示为正。
-    realized = sum(f["price"] * f["qty"] * (1 if f["side"] == "SELL" else -1)
-                   for f in history)
+    # 【P0 符号修复】已实现 = Σ(SELL proceeds) − Σ(BUY cost) − 双边手续费；
+    # SELL 正、BUY 负，末位不再取负。与 _daily_realized_pnl 同口径。
+    buy_cost = 0.0
+    sell_proceeds = 0.0
+    total_fee = 0.0
+    for f in history:
+        notional = f["price"] * f["qty"]
+        total_fee += notional * FEE_RATE_TAKER
+        if f["side"] == "SELL":
+            sell_proceeds += notional
+        else:
+            buy_cost += notional
+    realized = sell_proceeds - buy_cost - total_fee
     positions = adapter.query_positions()
     pos_details = []
     unrealized_total = 0.0
@@ -193,6 +211,7 @@ def _calc_pnl(adapter: BinanceTestnetAdapter,
             "unrealized_pnl": round(upnl, 2),
         })
     return {"realized_pnl": round(realized, 2), "unrealized_pnl": round(unrealized_total, 2),
+            "total_fees": round(total_fee, 2),
             "positions": pos_details, "total_fills": len(history)}
 
 
@@ -295,6 +314,7 @@ def _write_outputs(adapter: BinanceTestnetAdapter, trades: List[dict],
         "trades": trades,
         "realized_pnl": pnl["realized_pnl"],
         "unrealized_pnl": pnl["unrealized_pnl"],
+        "total_fees": pnl["total_fees"],
         "total_fills": pnl["total_fills"],
     }
     with open(os.path.join(PAPER_DIR, "testnet_state.json"), "w") as f:
@@ -318,6 +338,7 @@ def _write_outputs(adapter: BinanceTestnetAdapter, trades: List[dict],
         "",
         f"**已实现盈亏**: {pnl['realized_pnl']:.2f} USDT",
         f"**未实现盈亏(浮盈)**: {pnl['unrealized_pnl']:.2f} USDT",
+        f"**累计手续费**: {pnl['total_fees']:.2f} USDT",
         f"**KillSwitch**: {kill_switch.level.name if kill_switch else 'N/A'}",
         f"**累计成交笔数**: {pnl['total_fills']}",
         "",

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cryptoquant_auto.testnet_runner import _calc_pnl
+from cryptoquant_auto.testnet_runner import _calc_pnl, FEE_RATE_TAKER
 from cryptoquant_auto.models import Direction, Position
 
 
@@ -81,8 +81,11 @@ def test_calc_pnl_realized_sign_correct(monkeypatch):
         store["h"].append(f)
         _calc_pnl(a, {})
     r2 = _calc_pnl(a, {})
-    assert abs(r2["realized_pnl"] - 20.0) < 1e-6, "已实现盈亏符号反转未修复"
+    # 【P2-2】含双边手续费：净额 + 手续费 = 毛利 20；盈利日仍为正（舍入不变式）。
+    assert r2["realized_pnl"] > 0, "盈利日已实现盈亏应为正"
+    assert abs((r2["realized_pnl"] + r2["total_fees"]) - 20.0) < 1e-9, "净额+手续费应等于毛利20"
     assert r2["total_fills"] == 2
+    assert r2["total_fees"] > 0
 
 
 def test_daily_realized_pnl_sign_correct(monkeypatch):
@@ -92,3 +95,20 @@ def test_daily_realized_pnl_sign_correct(monkeypatch):
                         lambda: _sample_fills())
     from cryptoquant_auto.testnet_runner import _daily_realized_pnl
     assert _daily_realized_pnl() > 0, "日亏熔断输入符号反：盈利日被判为亏损"
+
+
+def test_calc_pnl_fees_deducted(monkeypatch):
+    # 【P2-2】已实现盈亏必须扣除双边手续费；total_fees 暴露且 > 0。
+    store = _patch_fill_io(monkeypatch)
+    a = SimpleNamespace()
+    a.fills = []
+    a.query_positions = lambda: []
+    for f in _sample_fills():
+        store["h"].append(f)
+    r = _calc_pnl(a, {})
+    gross = 120.0 - 100.0  # 低买高卖毛利 20.0
+    # 净额 + 手续费 = 毛利（round 到分后仍需成立，舍入不变式）
+    assert abs((r["realized_pnl"] + r["total_fees"]) - gross) < 1e-9
+    assert r["total_fees"] > 0
+    # 手续费 = (100+120)*1*FEE_RATE_TAKER，约吞 0.088 USDT（对分位舍入宽容）
+    assert abs(r["total_fees"] - (100.0 + 120.0) * 1.0 * FEE_RATE_TAKER) < 0.01

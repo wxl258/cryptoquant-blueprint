@@ -1,0 +1,33 @@
+# CryptoQuant 覆盖率配置（P2-5 门禁）
+#
+# 仅统计「生产引擎逻辑」覆盖率，排除：
+#   - demo*.py / demo_*          示例脚本
+#   - run_validation*.py         验证脚本自身（由 CI 单独 step 跑）
+#   - test_*.py / conftest.py    测试代码本身
+#   - __init__.py                包声明
+#   - 研究型重型模块（GP/NSGA-II、walk-forward、stock-sim、PCMCI/TFM 因子等）：
+#       这些由 CI 的 validation stage 单独验证，不计入「生产引擎」门禁分母，
+#       避免把 0% 研究模块稀释门禁，也避免门禁步骤因重型计算变慢。
+[run]
+branch = False
+omit =
+    */demo.py
+    */demo_sections.py
+    */demo_blueprint_*.py
+    */run_validation_*.py
+    */test_*.py
+    */conftest.py
+    */__init__.py
+    */sim/evolution.py
+    */sim/walk_forward.py
+    */sim/stocksim.py
+    */sim/market_path.py
+    */signals/gp_nsga2.py
+    */signals/tsfm.py
+    */signals/factor_combiner.py
+    */signals/factor_tests.py
+    */meta/*
+    */archive/*
+
+[report]
+show_missing = True
