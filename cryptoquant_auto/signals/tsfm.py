@@ -430,7 +430,7 @@ class TimesFMForecaster(TSFMForecaster):
             except ImportError as e:
                 raise ImportError("timesfm 未安装，TSFM 降级 numpy") from e
             self._model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
-                self._model_id, torch_compile=True)
+                self._model_id, torch_compile=False)
             self._model.compile(timesfm.ForecastConfig(
                 max_context=1024, max_horizon=256,
                 normalize_inputs=True, use_continuous_quantile_head=True,
