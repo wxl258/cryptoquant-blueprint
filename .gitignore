@@ -23,3 +23,8 @@ archive/
 
 # 【P1-5】历史 K 线缓存（build_history 联网重建，5MB+，不入库）
 cryptoquant_auto/history_cache.json
+
+# P2-5 覆盖率产物
+.coverage
+# 运行时日志
+paper/
