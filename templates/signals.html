@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CryptoQuant · 信号面板</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background: #0a0e1a; color: #c8d6e5; font-size: .9rem; }
+    .card { background: #131a2b; border: 1px solid #1e2a45; border-radius: 12px; margin-bottom: 1rem; }
+    .card-header { background: transparent; border-bottom: 1px solid #1e2a45; font-weight: 600; padding: .75rem 1rem; }
+    .nav-link { color: #6c7a8e; font-weight: 500; }
+    .nav-link:hover, .nav-link.active { color: #c8d6e5; }
+    .navbar { border-bottom: 1px solid #1e2a45; }
+    .btn-refresh { background: #1e2a45; border: none; color: #c8d6e5; border-radius: 8px; padding: .3rem .8rem; }
+    .btn-refresh:hover { background: #2a3a5e; }
+    .table { font-size: .85rem; }
+    .table th { border-color: #1e2a45; color: #6c7a8e; font-weight: 500; }
+    .table td { border-color: #1e2a45; vertical-align: middle; }
+    .positive { color: #7ddf8a; }
+    .negative { color: #df7d7d; }
+  </style>
+</head>
+<body>
+<nav class="navbar navbar-dark px-3 py-2">
+  <span class="fw-bold" style="color:#7ddf8a;">CryptoQuant</span>
+  <ul class="nav ms-auto">
+    <li class="nav-item"><a class="nav-link" href="/">概览</a></li>
+    <li class="nav-item"><a class="nav-link active" href="/signals">信号</a></li>
+    <li class="nav-item"><a class="nav-link" href="/logs">日志</a></li>
+  </ul>
+  <button class="btn-refresh ms-2" onclick="location.reload()">⟳</button>
+</nav>
+
+<div class="container-fluid px-3 py-3">
+  <div class="row g-3">
+    {% for r in records %}
+    <div class="col-md-6 col-lg-4">
+      <div class="card hover-scale">
+        <div class="card-header d-flex justify-content-between">
+          <span class="fw-bold">{{ r.symbol }}</span>
+          <span class="badge {{ 'bg-success' if r.action == 'LONG' else 'bg-warning text-dark' if r.action == 'HOLD' else 'bg-danger' }}">
+            {{ r.action }}
+          </span>
+        </div>
+        <div class="card-body">
+          <div class="row text-center mb-2">
+            <div class="col-4">
+              <div class="stat-label">置信</div>
+              <div class="fw-bold">{{ "%.0f"|format(r.confidence * 100) }}%</div>
+            </div>
+            <div class="col-4">
+              <div class="stat-label">市态</div>
+              <div class="fw-bold">{{ r.regime }}</div>
+            </div>
+            <div class="col-4">
+              <div class="stat-label">仓位</div>
+              <div class="fw-bold">{{ "%.1f"|format(r.proposed_exposure * 100) }}%</div>
+            </div>
+          </div>
+          {% if r.symbol in positions %}
+          <div class="alert alert-dark border-0 py-1 px-2 mb-0" style="background:#1e2a45;font-size:.8rem;">
+            实盘: {{ positions[r.symbol].direction }} · 浮盈 {{ "%.2f"|format(positions[r.symbol].unrealized_pnl) }}
+          </div>
+          {% endif %}
+          <div class="mt-2" style="font-size:.75rem;color:#6c7a8e;">{{ r.rationale|join(" · ") }}</div>
+          {% if r.vetoes %}
+          <div class="mt-1"><span class="badge bg-secondary">否决: {{ r.vetoes|join(", ") }}</span></div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+
+<style>
+  .hover-scale { transition: transform .15s; }
+  .hover-scale:hover { transform: scale(1.01); }
+  .stat-label { font-size: .7rem; color: #6c7a8e; text-transform: uppercase; }
+</style>
+<script>setTimeout(() => location.reload(), 300_000);</script>
+</body>
+</html>

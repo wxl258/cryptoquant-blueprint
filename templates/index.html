@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CryptoQuant 仪表盘</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <style>
+    body { background: #0a0e1a; color: #c8d6e5; font-size: .9rem; }
+    .card { background: #131a2b; border: 1px solid #1e2a45; border-radius: 12px; }
+    .card-header { background: transparent; border-bottom: 1px solid #1e2a45; font-weight: 600; padding: .75rem 1rem; }
+    .stat-value { font-size: 1.6rem; font-weight: 700; }
+    .stat-label { font-size: .75rem; color: #6c7a8e; text-transform: uppercase; letter-spacing: .03em; }
+    .badge-ks-l0 { background: #1a5e2a; color: #7ddf8a; }
+    .badge-ks-l1 { background: #5e4a1a; color: #dfc67d; }
+    .badge-ks-l2 { background: #5e1a1a; color: #df7d7d; }
+    .badge-ks-l3 { background: #3d0a0a; color: #ff4444; }
+    .table { font-size: .85rem; }
+    .table th { border-color: #1e2a45; color: #6c7a8e; font-weight: 500; }
+    .table td { border-color: #1e2a45; vertical-align: middle; }
+    .positive { color: #7ddf8a; }
+    .negative { color: #df7d7d; }
+    .fill-row { font-size: .8rem; }
+    .nav-link { color: #6c7a8e; font-weight: 500; }
+    .nav-link:hover, .nav-link.active { color: #c8d6e5; }
+    .navbar { border-bottom: 1px solid #1e2a45; }
+    .btn-refresh { background: #1e2a45; border: none; color: #c8d6e5; border-radius: 8px; padding: .3rem .8rem; }
+    .btn-refresh:hover { background: #2a3a5e; }
+    .progress { height: 4px; background: #1e2a45; }
+    .pnl-bar { height: 6px; border-radius: 3px; }
+    .chart-container { height: 120px; }
+    .hover-scale { transition: transform .15s; }
+    .hover-scale:hover { transform: scale(1.02); }
+    @media (max-width: 576px) {
+      .stat-value { font-size: 1.2rem; }
+      .card { margin-bottom: .75rem; }
+    }
+  </style>
+</head>
+<body>
+
+<nav class="navbar navbar-dark px-3 py-2">
+  <span class="fw-bold" style="color:#7ddf8a;">CryptoQuant</span>
+  <ul class="nav ms-auto">
+    <li class="nav-item"><a class="nav-link active" href="/">概览</a></li>
+    <li class="nav-item"><a class="nav-link" href="/signals">信号</a></li>
+    <li class="nav-item"><a class="nav-link" href="/logs">日志</a></li>
+  </ul>
+  <button class="btn-refresh ms-2" onclick="location.reload()">⟳</button>
+</nav>
+
+<div class="container-fluid px-3 py-3">
+  <div class="row g-3">
+
+    <!-- === 汇总卡片 === -->
+    <div class="col-6 col-md-3">
+      <div class="card p-3 text-center hover-scale">
+        <div class="stat-label">总盈亏</div>
+        <div class="stat-value {{ 'positive' if total >= 0 else 'negative' }}">
+          {{ "+" if total >= 0 else "" }}{{ "%.0f"|format(total) }}
+        </div>
+        <small class="stat-label">USDT</small>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card p-3 text-center hover-scale">
+        <div class="stat-label">已实现</div>
+        <div class="stat-value {{ 'positive' if realized >= 0 else 'negative' }}">
+          {{ "+" if realized >= 0 else "" }}{{ "%.0f"|format(realized) }}
+        </div>
+        <small class="stat-label">USDT</small>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card p-3 text-center hover-scale">
+        <div class="stat-label">浮盈</div>
+        <div class="stat-value {{ 'positive' if unrealized >= 0 else 'negative' }}">
+          {{ "+" if unrealized >= 0 else "" }}{{ "%.1f"|format(unrealized) }}
+        </div>
+        <small class="stat-label">USDT</small>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card p-3 text-center hover-scale">
+        <div class="stat-label">手续费</div>
+        <div class="stat-value" style="color:#6c7a8e;">{{ "%.1f"|format(fees) }}</div>
+        <small class="stat-label">USDT</small>
+      </div>
+    </div>
+
+    <!-- === 最近成交 === -->
+    <div class="col-md-8">
+      <div class="card">
+        <div class="card-header d-flex justify-content-between">
+          <span>最近成交（{{ fills_count }} 笔）</span>
+          <span class="text-muted" style="font-size:.75rem;">最后 cron: {{ cron_last }}</span>
+        </div>
+        <div class="card-body p-0">
+          {% if recent_fills %}
+          <table class="table table-dark table-hover mb-0">
+            <thead><tr>
+              <th>时间</th><th>币</th><th>方向</th><th>数量</th><th>价格</th>
+            </tr></thead>
+            <tbody>
+            {% for f in recent_fills %}
+            <tr class="fill-row">
+              <td>{{ f.ts|int|strftime }}</td>
+              <td class="fw-bold">{{ f.symbol }}</td>
+              <td><span class="badge {{ 'bg-success' if f.side == 'BUY' else 'bg-danger' }}">{{ f.side }}</span></td>
+              <td>{{ "%.4f"|format(f.qty) }}</td>
+              <td>{{ "%.2f"|format(f.price) }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          {% else %}
+          <div class="p-4 text-center text-muted">暂无成交记录</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <!-- === 当前持仓 === -->
+    <div class="col-md-4">
+      <div class="card">
+        <div class="card-header">当前持仓（{{ positions|length }}）</div>
+        <div class="card-body p-0">
+          {% if positions %}
+          <table class="table table-dark mb-0">
+            <thead><tr><th>币</th><th>方向</th><th>数量</th><th>浮盈</th></tr></thead>
+            <tbody>
+            {% for p in positions %}
+            <tr>
+              <td class="fw-bold">{{ p.symbol }}</td>
+              <td><span class="badge {{ 'bg-success' if p.direction == 'LONG' else 'bg-danger' }}">{{ p.direction }}</span></td>
+              <td>{{ "%.4f"|format(p.qty) }}</td>
+              <td class="{{ 'positive' if p.unrealized_pnl >= 0 else 'negative' }}">
+                {{ "+" if p.unrealized_pnl >= 0 else "" }}{{ "%.2f"|format(p.unrealized_pnl) }}
+              </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          {% else %}
+          <div class="p-4 text-center text-muted">空仓</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+  // auto-refresh every 300s (5 min)
+  setTimeout(() => location.reload(), 300_000);
+</script>
+</body>
+</html>
