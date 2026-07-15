@@ -152,8 +152,13 @@ def _load_fill_history() -> List[dict]:
     return []
 
 
+MAX_FILLS = 200  # fill_history 最大条目（P2-6 清理）
+
+
 def _save_fill_history(history: List[dict]) -> None:
     path = os.path.join(PAPER_DIR, "fill_history.json")
+    if len(history) > MAX_FILLS:
+        history = history[-MAX_FILLS:]
     with open(path, "w") as f:
         json.dump(history, f, ensure_ascii=False)
 
@@ -261,11 +266,11 @@ def sync_positions(adapter: BinanceTestnetAdapter,
     持仓/挂单按真实状态决策，冲突挂单先撤。
     """
     trades: List[dict] = []
-    # 刷新失败（网络/非200/json异常）→ 返回 None；此时内存持仓为空，
-    # 若继续会盲目重复开单，故跳过本轮，等下次 cron 重试。
+    # 【P0-1 修复】刷新失败 → 返回 None（main 据此跳过写入脏数据）；
+    # 此前返回空 trades → _write_outputs 仍被调用 → 空仓位覆盖 testnet_state.json。
     if adapter.refresh_positions() is None or adapter.refresh_open_orders() is None:
         logger.error("[testnet] 持仓/挂单刷新失败, 跳过本轮, 避免盲目重复开单")
-        return trades
+        return None
     positions_map = {p.symbol: p for p in adapter.query_positions()}
     open_map = {o.symbol: o for o in adapter.query_open()}
 
@@ -297,10 +302,14 @@ def sync_positions(adapter: BinanceTestnetAdapter,
         if cur_dir == action:
             continue
 
-        # 【P0-1】KillSwitch 熔断：L1+ 暂停新开仓；HOLD 平仓（上面已处理）不受影响
+        # 【P0-1】KillSwitch 熔断：L1+ 暂停新开仓；L2+ 同时平现有仓位（真减仓）
         if not kill_switch.allows_new():
             logger.warning("  [testnet] KillSwitch=%s 暂停新开, 跳过 %s 开仓",
                            kill_switch.level.name, sym)
+            # 【P0-2】L2+ 减仓语义：即使信号与持仓同方向也强制平仓
+            if kill_switch.level.value >= 2.0 and cur_dir:
+                _close_position(adapter, sym, cur, price, trades)
+                logger.warning("  [testnet]   L2+ 减仓 %s (KillSwitch=%s)", sym, kill_switch.level.name)
             continue
 
         # 方向反转 → 先平旧仓 + 撤冲突挂单，再开新仓
@@ -338,6 +347,34 @@ def sync_positions(adapter: BinanceTestnetAdapter,
         logger.info("  [testnet] %s 开仓 %s qty=%s", sym, action, qty)
 
     return trades
+
+
+TTL_HOURS = 72  # 持仓超过此时间自动平仓（P1-5）
+
+
+def _close_stale_positions(adapter: BinanceTestnetAdapter,
+                            prices: Dict[str, float],
+                            kill_switch: KillSwitch,
+                            trades: List[dict]) -> None:
+    """根据 fill_history 检查每笔持仓的入场时间，超时自动平仓。
+
+    从 adapter.query_positions() 获取真实持仓，从 fill_history 反推入场时间。
+    超过 TTL_HOURS 的仓位强制平仓，不受信号方向影响。
+    """
+    now = time.time()
+    history = _load_fill_history()
+    # 按 symbol 找最近一次 BUY 入场（假设最近一次 BUY 是当前持仓的开仓）
+    entry_ts: Dict[str, float] = {}
+    for f in history:
+        if f["side"] == "BUY":
+            entry_ts[f["symbol"]] = max(entry_ts.get(f["symbol"], 0), f["ts"])
+    cutoff = now - TTL_HOURS * 3600
+    for p in adapter.query_positions():
+        sym = str(p.symbol)
+        opened = entry_ts.get(sym, 0)
+        if opened > 0 and opened < cutoff:
+            logger.warning("  [TTL] %s 持仓超 %.0fh (入场=%.0fs), 自动平仓", sym, TTL_HOURS, opened)
+            _close_position(adapter, sym, p, prices.get(sym, 0), trades)
 
 
 def _write_outputs(adapter: BinanceTestnetAdapter, trades: List[dict],
@@ -428,12 +465,32 @@ def main() -> int:
     ks = KillSwitch()
     daily_rp = _daily_realized_pnl()
     daily_pnl = daily_rp / EQUITY_USDT if EQUITY_USDT > 0 else 0.0
-    ks.update(daily_pnl=daily_pnl)
-    logger.info("  [风控] equity=%.0f 当日已实现=%.2f daily_pnl=%.2f%% KillSwitch=%s",
-                EQUITY_USDT, daily_rp, daily_pnl * 100, ks.level.name)
+    # 【P1-4】KillSwitch 需 peak_dd 才能使 L3 条件可达
+    total_history = _load_fill_history()
+    total_pnl = sum(f["price"] * f["qty"] * (1 if f["side"] == "SELL" else -1) for f in total_history)
+    total_pnl -= sum(f["price"] * f["qty"] * FEE_RATE_TAKER for f in total_history)  # 扣手续费
+    current_equity = EQUITY_USDT + total_pnl
+    peak_dd = max(0.0, (EQUITY_USDT - max(current_equity, EQUITY_USDT)) / EQUITY_USDT)  # 0 = 无回撤
+    ks.update(daily_pnl=daily_pnl, peak_dd=-peak_dd)
+    logger.info("  [风控] equity=%.0f 当日=%.2f daily_pnl=%.2f%% peak_dd=%.2f%% KillSwitch=%s",
+                EQUITY_USDT, daily_rp, daily_pnl * 100, peak_dd * 100, ks.level.name)
+    # 【P0-3】KillSwitch 降级告警
+    if ks.level.value >= 0.5:
+        logger.error("⛔ KillSwitch=%s 降级中(日亏=%.2f%% peak_dd=%.2f%%)",
+                     ks.level.name, daily_pnl * 100, peak_dd * 100)
+
+    # 【P1-5】仓位 TTL 检查：超过 72h 的仓位强制平仓
+    ttl_trades: List[dict] = []  # 收集 TTL 平仓记录
+    _close_stale_positions(adapter, prices, ks, ttl_trades)
+    logger.info("  [TTL] 超时平仓 %d 笔", len(ttl_trades))
 
     # 同步持仓
     trades = sync_positions(adapter, signals, prices, ks, gate_cfg, details=paper_detail)
+    # 【P0-1 修复】refresh 失败 → 跳过写入脏数据，保留上轮健康状态
+    if trades is None:
+        logger.error("[testnet] 刷新失败，跳过本轮写入，保留上轮状态")
+        return 1
+    trades = (ttl_trades or []) + (trades or [])
     logger.info("  本轮操作 %d 笔", len(trades))
 
     # 输出
