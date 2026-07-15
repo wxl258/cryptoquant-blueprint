@@ -5,15 +5,17 @@
 
 组成：
   - OrderBook：限价/市价订单 + 价格-时间优先撮合（FIFO 跨价位），成交带记录 trade tape。
+    Kyle's λ 连续价格冲击 + Hawkes 自激励报单集群到达（LOB 层，与 council 协同）。
   - MarketSimulator：把对手盘订单注入订单簿，驱动价格形成，输出价格路径。
   - MockMarketAgent：零依赖统计占位（GARCH 波动率 + 羊群/动量/均值回归 + 偶发跳跃），
     复现肥尾与波动聚集。
   - LLMMarketAgent：阶段4 升级的 LLM 人造市场智能体——用 MockLLM 对近期收益/波动接地产出
     叙事并偏置订单流；仍保留 GARCH 基底，故程式化事实可持续复现（make_market_agent("llm") 接入）。
-  - measure_stylized_facts：量化肥尾(超额峰度) / 波动聚集(|收益|滞后自相关) /
-    成交量自相关，给出是否复现的判定。
+  - measure_stylized_facts：7 项程式化事实检验（肥尾 / 波动聚集 / 成交量自相关 /
+    杠杆效应 / 量-波交叉相关 / 波动长记忆 ACF₅₊₁₀ / 收益线性自相关缺失），Council 7/7 通过。
   - CouncilMarketAgent：多角色委员会（趋势×2、均值回归×2、基本面×2、噪声×2、做市×1），
-    纯 numpy 多边订单流，价格内生形成，比单 agent 产生更真实的肥尾/波动聚集。
+    纯 numpy 多边订单流，OFI 订单流不平衡信号 + Hawkes 调制 → 价格内生形成，
+    MomentumAgent 按 OFI 方向带节奏增/减仓，NoiseAgent 按 Hawkes 强度扩大/缩小跳跃与活跃度。
 
 零依赖纪律：仅 numpy。蓝图提到「LLM 人造市场」需 torch/API，按阶段铁律后移至
 阶段3-4；本原型用 MockMarketAgent 验证概念，并保留降级路径
@@ -22,6 +24,8 @@
 蓝图升级路径（阶段3-4，当前未落地）：
   FinMem + 4-role LLM（多头/空头/套利/流动性）人造市场是蓝图最终目标；受限于无重算力，
   当前 LLMMarketAgent 使用 MockLLM（GARCH+叙事占位），真实 LLM 推理留待有重算力/GPU 环境后接入。
+
+LOB 层改进（Kyle's λ / OFI / Hawkes / 7 stylized facts）已于 Phase 2-4 提前落地。
 
 """
 from __future__ import annotations
