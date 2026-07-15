@@ -188,7 +188,13 @@ class DecisionMaker:
             spi_surprise=spi_surprise,
         )
         # LLM 只填表（确定性接地 + 严格 schema 校验）
-        return self.llm.produce(ctx)
+        dec = self.llm.produce(ctx)
+        # 【P0-2】把规则融合方向挂到决策上，供 RiskController 校验 LLM 是否偏离
+        try:
+            dec.fused_action = fused
+        except Exception:
+            pass
+        return dec
 
 
 # ============================ ④ RiskController ============================
@@ -196,10 +202,17 @@ class RiskController:
     """宪法式硬锁：禁易 regime / 置信钳制 / 高不确定转 HOLD。"""
 
     def guard(self, dec: LLMDecision, profile, spi_surprise: float = 0.0,
-              regime: Optional[str] = None) -> (str, List[str], float):
+              regime: Optional[str] = None,
+              fused_action: Optional[str] = None) -> (str, List[str], float):
         vetoes: List[str] = []
         action = dec.proposed_action
         conf = dec.confidence
+
+        # 【P0-2】锁死 LLM 方向：若 LLM 偏离规则融合方向，fail-closed 降级 HOLD，
+        # 杜绝"LLM 说了算"的策略漂移（RealLLM 自由意志越界即失效）。
+        if fused_action is not None and action != fused_action:
+            vetoes.append(f"llm_diverged:llm={action},fused={fused_action}")
+            action = HOLD
 
         # 禁易 regime（反思自改进写入 Profile）。【P0-3 修复】统一命名空间：
         # reflect() 把禁易键存为原始 regime（如 "TREND"），而本方法旧版只比对
@@ -276,8 +289,10 @@ class FourRoleCouncil:
         dec = self.decider.propose(symbol, feat, regime, a, r, self.memory,
                                    spi_surprise=spi_surprise, forecast=forecast)
         # 初筛：先以 spi=0 跑一次风控门，得到本轮置信（供 conformal 评估）
+        fused_action = getattr(dec, "fused_action", None)
         action, vetoes, conf = RiskController().guard(
-            dec, self.profile, spi_surprise=0.0, regime=regime)
+            dec, self.profile, spi_surprise=0.0, regime=regime,
+            fused_action=fused_action)
         # 【P1-10 修复】SPCI 在线惊喜度：用跨 tick 历史置信分布自适应评估
         # 「本轮置信是否异常」。先以 prior 窗口算惊喜度（留一，避免自污染），
         # 再喂入本轮 score 供下轮使用；最后用真实 spi 重跑风控门使软降级生效。
@@ -289,7 +304,8 @@ class FourRoleCouncil:
             conformal.update(score)
             if spi != 0.0:
                 action, vetoes, conf = RiskController().guard(
-                    dec, self.profile, spi_surprise=spi, regime=regime)
+                    dec, self.profile, spi_surprise=spi, regime=regime,
+                    fused_action=fused_action)
 
         verdict = CouncilVerdict(
             symbol=symbol, regime=regime,

@@ -10,3 +10,16 @@ paper/paper_state.json
 paper/paper_journal.jsonl
 paper/paper_dashboard.md
 .llm_secret
+
+# 【P0-3】测试网/实盘密钥：仅本机明文，严禁入库。.testnet_secret 为 Binance
+# 测试网 API Key/Secret，曾被明文置于服务器且未忽略，存在误提交泄露风险。
+.testnet_secret
+# .testnet_secret.example 为模板（无真实密钥），可入库，不在此忽略。
+
+# 【P1-1】归档历史备份（.bak_*/.safeguard_* 已移入 archive/，保留不删，但不入库）
+archive/
+*.bak*
+.safeguard*
+
+# 【P1-5】历史 K 线缓存（build_history 联网重建，5MB+，不入库）
+cryptoquant_auto/history_cache.json

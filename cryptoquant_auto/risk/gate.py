@@ -17,6 +17,14 @@ TOTAL_CAP_PCT = 0.12     # 总仓位硬上限（名义/权益）
 SINGLE_CAP_PCT = 0.04    # 单币上限
 
 
+class GateRejected(Exception):
+    """交易闸门拒绝（Fail-closed 硬拒信号）。
+
+    A/B harness 在 LLM 未通过放行闸门(recommend_llm=False)时抛出，
+    调用方必须显式捕获——无捕获即视为「未放行」，禁止采用 LLM 策略。
+    """
+
+
 @dataclass
 class GateConfig:
     equity: float = 100_000.0

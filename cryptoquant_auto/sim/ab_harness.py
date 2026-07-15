@@ -16,6 +16,7 @@ from typing import List, Dict, Any
 import numpy as np
 
 from .metrics import deflated_sharpe, probabilistic_sharpe, bh_fdr
+from ..risk.gate import GateRejected
 
 
 # ---------- 轻量 t 分布（双侧 p，无 scipy）----------
@@ -171,6 +172,21 @@ def controlled_ab(returns_rule, returns_llm, n_trials: int = 1,
         "sr_llm": float(l.mean() / (l.std(ddof=1) + 1e-12) * math.sqrt(periods_per_year)),
     }
     return res
+
+
+def assert_gate_passed(res: "ABResult") -> None:
+    """【P1-6】代码级硬拒：A/B 闸门未过则抛 GateRejected（Fail-closed）。
+
+    controlled_ab 默认只 return 结论(recommend_llm)，调用方可无视。本函数把
+    「未放行」升级为异常——任何试图采用 LLM 策略的代码路径必须显式捕获
+    GateRejected，否则异常上抛即阻断（杜绝「只 return 不拒」的静默放行）。
+    """
+    if not res.recommend_llm:
+        raise GateRejected(
+            f"A/B gate rejected: winner={res.winner} significant={res.significant} "
+            f"dsr_rule={res.dsr_rule:.3f} dsr_llm={res.dsr_llm:.3f} "
+            f"p={res.p_value:.4f} (LLM 未通过放行闸门)"
+        )
 
 
 def make_synthetic_returns(n: int, sr_target: float, seed: int = 7,

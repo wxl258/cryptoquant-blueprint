@@ -18,20 +18,26 @@ import math
 import os
 import sys
 import time
+from datetime import datetime, time as _dtime
 from typing import Dict, List, Optional, Tuple
 
 import requests
 import urllib.request
 
 from .adapters.binance_testnet import BinanceTestnetAdapter
-from .models import Direction, OrderType
+from .models import Direction, OrderType, Order
 from .risk.constitution import TradingConstitution
+from .risk.gate import GateConfig, assert_pre_trade
+from .risk.kill_switch import KillSwitch
 
 logger = logging.getLogger("cryptoquant.testnet")
 
 # 配置参数（可通过环境变量覆盖）
 POS_SIZE_USDT = int(os.getenv("CRYPTOQUANT_POS_SIZE", "100"))   # 每币基柱 USDT
 LEVERAGE = int(os.getenv("CRYPTOQUANT_LEVERAGE", "2"))           # 杠杆倍数
+# 测试网账户权益（gate 单币/总仓比例 + KillSwitch 日亏比例的基准）。
+# 默认 5000 → 固定 200USDT 单币 ≈ 4% 对齐 SINGLE_CAP_PCT，使闸门阈值有意义。
+EQUITY_USDT = float(os.getenv("CRYPTOQUANT_EQUITY_USDT", "5000"))
 
 # 币安 USDT-M 合约 LOT_SIZE 步长（api/v1/exchangeInfo 可查，硬编码省一次 API 调用）
 _STEP_SIZES = {
@@ -118,6 +124,19 @@ def _save_fill_history(history: List[dict]) -> None:
         json.dump(history, f, ensure_ascii=False)
 
 
+def _daily_realized_pnl() -> float:
+    """当日（自然日 00:00 起）已实现盈亏（USDT）。供 KillSwitch 日亏熔断用。
+
+    按自然日重置，避免把长期累计微亏误触 L2；与 ExecutionEngine._realized_day 同口径。
+    """
+    history = _load_fill_history()
+    today_start = datetime.combine(datetime.now().date(), _dtime.min).timestamp()
+    # 【P0 符号修复】已实现 = Σ(卖出台约 proceeds) − Σ(买入成本)：SELL 记正、BUY 记负，
+    # 末位**不再**取负。此前多乘 -1 使符号整体反，会把盈利日误判为亏损、误触发 L1 日亏熔断。
+    return sum(f["price"] * f["qty"] * (1 if f["side"] == "SELL" else -1)
+               for f in history if float(f.get("ts", 0)) >= today_start)
+
+
 def _close_position(adapter: BinanceTestnetAdapter, sym: str,
                     cur, price: float, trades: List[dict]) -> None:
     """按真实持仓量平仓（激进限价），记录回执。"""
@@ -137,8 +156,11 @@ def _close_position(adapter: BinanceTestnetAdapter, sym: str,
     logger.info("  [testnet] %s 平仓 %s qty=%s", sym, side, qty)
 
 
-def _calc_pnl(adapter: BinanceTestnetAdapter) -> dict:
+def _calc_pnl(adapter: BinanceTestnetAdapter,
+              prices: Optional[Dict[str, float]] = None) -> dict:
     """汇总测试网 P&L；成交数与已实现盈亏跨 run 持久化（修复'累计'口径）。"""
+    if prices is None:
+        prices = {}
     run_fills = getattr(adapter, "fills", [])
     history = _load_fill_history()
     for f in run_fills:
@@ -148,22 +170,37 @@ def _calc_pnl(adapter: BinanceTestnetAdapter) -> dict:
     _save_fill_history(history)
     logger.info("[debug] run_fills=%d history=%d positions=%d",
                 len(run_fills), len(history), len(adapter.query_positions()))
-    # 简算已实现（未计手续费/资金费）；现基于跨 run 累计历史，标签才名副其实
+    # 【P0 符号修复】已实现 = Σ(SELL proceeds) − Σ(BUY cost)：SELL 正、BUY 负，末位不再取负。
+    # 与 _daily_realized_pnl 同口径；此前 -1 导致符号反，盈利显示为负、亏损显示为正。
     realized = sum(f["price"] * f["qty"] * (1 if f["side"] == "SELL" else -1)
-                   for f in history) * -1
+                   for f in history)
     positions = adapter.query_positions()
-    pos_details = [{
-        "symbol": p.symbol, "direction": p.direction.value,
-        "qty": float(p.qty), "entry_price": float(p.entry_price),
-        "unrealized_pnl": 0.0,
-    } for p in positions]
-    return {"realized_pnl": round(realized, 2), "unrealized_pnl": 0.0,
+    pos_details = []
+    unrealized_total = 0.0
+    for p in positions:
+        qty = float(p.qty)
+        entry = float(p.entry_price)
+        direction = p.direction.value if hasattr(p.direction, "value") else str(p.direction)
+        mark = prices.get(p.symbol)
+        if mark is not None and qty > 1e-9:
+            upnl = (entry - mark) * qty if direction == "SHORT" else (mark - entry) * qty
+        else:
+            upnl = 0.0
+        unrealized_total += upnl
+        pos_details.append({
+            "symbol": p.symbol, "direction": direction,
+            "qty": qty, "entry_price": entry,
+            "unrealized_pnl": round(upnl, 2),
+        })
+    return {"realized_pnl": round(realized, 2), "unrealized_pnl": round(unrealized_total, 2),
             "positions": pos_details, "total_fills": len(history)}
 
 
 def sync_positions(adapter: BinanceTestnetAdapter,
                     signals: Dict[str, str],
-                    prices: Dict[str, float]) -> List[dict]:
+                    prices: Dict[str, float],
+                    kill_switch: KillSwitch,
+                    gate_cfg: GateConfig) -> List[dict]:
     """根据最新信号同步测试网持仓（跨 run 持久化真实持仓/挂单）。
 
     修复：先拉测试网真实持仓与挂单，否则每轮从空开始会重复开单、无力平仓历史单；
@@ -201,6 +238,12 @@ def sync_positions(adapter: BinanceTestnetAdapter,
         if cur_dir == action:
             continue
 
+        # 【P0-1】KillSwitch 熔断：L1+ 暂停新开仓；HOLD 平仓（上面已处理）不受影响
+        if not kill_switch.allows_new():
+            logger.warning("  [testnet] KillSwitch=%s 暂停新开, 跳过 %s 开仓",
+                           kill_switch.level.name, sym)
+            continue
+
         # 方向反转 → 先平旧仓 + 撤冲突挂单，再开新仓
         if cur_dir:
             _close_position(adapter, sym, cur, price, trades)
@@ -216,6 +259,15 @@ def sync_positions(adapter: BinanceTestnetAdapter,
         if qty < 0.001:
             logger.warning("  [testnet] %s qty=%s 过小跳过", sym, qty)
             continue
+        # 【P0-1】开仓前过四闸门（单币/总仓/regime/beta/过热）；Gate B 默认关闭，
+        # 仅作纪律护栏，不触发"edge 未校准→全空仓"。
+        order = Order(coid=f"sig_{sym}", symbol=sym, side=open_side, qty=qty,
+                      price=price, otype=OrderType.ENTRY, signal_id=f"sig_{sym}")
+        gate_res = assert_pre_trade(order, list(positions_map.values()), gate_cfg, {})
+        if not gate_res.ok:
+            logger.warning("  [testnet] %s 闸门拒绝新开: %s",
+                           sym, "; ".join(gate_res.reasons))
+            continue
         # 市价单开仓：同上，绕开测试网过期价格过滤器，实测可成交。
         resp = adapter.submit_market(sym, open_side, qty,
                                      signal_id=f"sig_{sym}")
@@ -230,16 +282,19 @@ def sync_positions(adapter: BinanceTestnetAdapter,
 
 
 def _write_outputs(adapter: BinanceTestnetAdapter, trades: List[dict],
-                   signals: Dict[str, str]) -> None:
+                   signals: Dict[str, str],
+                   prices: Optional[Dict[str, float]] = None,
+                   kill_switch: Optional[KillSwitch] = None) -> None:
     """输出测试网状态 + 仪表盘。"""
     os.makedirs(PAPER_DIR, exist_ok=True)
-    pnl = _calc_pnl(adapter)
+    pnl = _calc_pnl(adapter, prices)
     out = {
         "updated": time.time(),
         "signals": signals,
         "positions": pnl["positions"],
         "trades": trades,
         "realized_pnl": pnl["realized_pnl"],
+        "unrealized_pnl": pnl["unrealized_pnl"],
         "total_fills": pnl["total_fills"],
     }
     with open(os.path.join(PAPER_DIR, "testnet_state.json"), "w") as f:
@@ -262,6 +317,8 @@ def _write_outputs(adapter: BinanceTestnetAdapter, trades: List[dict],
     lines += [
         "",
         f"**已实现盈亏**: {pnl['realized_pnl']:.2f} USDT",
+        f"**未实现盈亏(浮盈)**: {pnl['unrealized_pnl']:.2f} USDT",
+        f"**KillSwitch**: {kill_switch.level.name if kill_switch else 'N/A'}",
         f"**累计成交笔数**: {pnl['total_fills']}",
         "",
         "## 最近操作",
@@ -305,12 +362,21 @@ def main() -> int:
     constitution = TradingConstitution(live_capital=False)
     adapter = BinanceTestnetAdapter(key, sec, constitution=constitution)
 
+    # 【P0-1】风控接线：gate(四闸单币/总仓) + KillSwitch(日亏熔断)
+    gate_cfg = GateConfig(equity=EQUITY_USDT, enforce_gate_b=False)
+    ks = KillSwitch()
+    daily_rp = _daily_realized_pnl()
+    daily_pnl = daily_rp / EQUITY_USDT if EQUITY_USDT > 0 else 0.0
+    ks.update(daily_pnl=daily_pnl)
+    logger.info("  [风控] equity=%.0f 当日已实现=%.2f daily_pnl=%.2f%% KillSwitch=%s",
+                EQUITY_USDT, daily_rp, daily_pnl * 100, ks.level.name)
+
     # 同步持仓
-    trades = sync_positions(adapter, signals, prices)
+    trades = sync_positions(adapter, signals, prices, ks, gate_cfg)
     logger.info("  本轮操作 %d 笔", len(trades))
 
     # 输出
-    _write_outputs(adapter, trades, signals)
+    _write_outputs(adapter, trades, signals, prices, ks)
     return 0
 
 

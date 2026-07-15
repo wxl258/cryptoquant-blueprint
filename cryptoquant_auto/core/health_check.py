@@ -47,3 +47,22 @@ def check_module_integrity(modules: List[str] = None) -> HealthReport:
             rep.modules[name] = f"FAIL:{type(e).__name__}:{e}"
             rep.healthy = False
     return rep
+
+
+def _format_report(rep: HealthReport) -> str:
+    lines = ["[health_check] 模块完整性自检:"]
+    for name, status in rep.modules.items():
+        lines.append(f"  {'OK ' if status.startswith('OK') else 'XX '} {name} -> {status}")
+    lines.append(f"[health_check] healthy={rep.healthy}")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    """CLI 入口：运行完整性自检，不健康即 exit 1（供 cron fail-closed 判定）。"""
+    rep = check_module_integrity()
+    print(_format_report(rep))
+    return 0 if rep.healthy else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

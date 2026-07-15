@@ -55,6 +55,35 @@ from .risk.cvar_optimizer import CvarPositionOptimizer, cvar as _cvar_of, HAS_SC
 
 ACTION_TO_INT = {"LONG": 0, "SHORT": 1, "HOLD": 2}
 
+# 【P0-5】只读 HTTP 拉取重试：指数退避 0.5→1.0→2.0s，默认 3 次尝试；全部失败才抛出，
+# 由调用方 snapshot 的 try/except 接住并降级到上次成功快照（last-good 缓存）。
+HTTP_RETRY = 3
+_HTTP_BACKOFF = (0.5, 1.0, 2.0)
+
+
+def _fetch_json_retry(url: str, timeout: float = 10.0) -> dict:
+    """带指数退避的只读 JSON 拉取（网络/超时/非 200/json 异常均重试）。
+
+    返回解析后的 dict；重试耗尽仍失败则抛出最后一个异常，交由 snapshot 降级处理。
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(HTTP_RETRY):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "cryptoquant-paper/0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception as e:  # 网络中断 / 超时 / HTTP 非 200 / JSON 解析失败
+            last_err = e
+            if attempt < HTTP_RETRY - 1:
+                delay = _HTTP_BACKOFF[min(attempt, len(_HTTP_BACKOFF) - 1)]
+                logger.warning("[http] %s 第%d次失败(%s)，%.1fs 后重试",
+                               url, attempt + 1, e, delay)
+                time.sleep(delay)
+            else:
+                logger.error("[http] %s 重试%d次仍失败: %s", url, HTTP_RETRY, e)
+    raise last_err if last_err else RuntimeError("unreachable")
+
+
 PAPER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "paper")
 
 # 【P2 修复】审计日志有界化：paper_journal.jsonl 原为 append-only、无轮转无截断，
@@ -174,12 +203,12 @@ class GateioPublicDataSource(DataSource):
         self.warmup = warmup
         self.limit = limit
         self._fng = 50.0
+        self._last_good: Dict[str, dict] = {}  # 【P0-5】last-good 缓存，拉取失败降级用
 
     @staticmethod
     def _get_json(url: str, timeout: float = 10.0):
-        req = urllib.request.Request(url, headers={"User-Agent": "cryptoquant-paper/0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+        # 【P0-5】委托给带指数退避重试的模块级助手
+        return _fetch_json_retry(url, timeout)
 
     def _refresh_fng(self):
         try:
@@ -230,8 +259,15 @@ class GateioPublicDataSource(DataSource):
                     "price": float(k1h[i]["c"]),
                     "ts": int(k1h[i]["t"]),
                 }
+                self._last_good[s] = out[s]  # 【P0-5】记录 last-good
             except Exception as e:
-                logger.warning("[gateio] %s 拉取失败: %s", s, e)
+                cached = self._last_good.get(s)
+                if cached is not None:
+                    out[s] = cached
+                    logger.warning("[gateio] %s 拉取失败(%s)，降级用上次成功快照 ts=%d",
+                                   s, e, cached.get("ts"))
+                else:
+                    logger.warning("[gateio] %s 拉取失败: %s", s, e)
                 continue
         return out
 
@@ -259,12 +295,12 @@ class BinancePublicDataSource(DataSource):
         self.warmup = warmup
         self.limit = limit
         self._fng = 50.0
+        self._last_good: Dict[str, dict] = {}  # 【P0-5】last-good 缓存，拉取失败降级用
 
     @staticmethod
     def _get_json(url: str, timeout: float = 10.0):
-        req = urllib.request.Request(url, headers={"User-Agent": "cryptoquant-paper/0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+        # 【P0-5】委托给带指数退避重试的模块级助手
+        return _fetch_json_retry(url, timeout)
 
     def _refresh_fng(self):
         try:
@@ -325,8 +361,15 @@ class BinancePublicDataSource(DataSource):
                     "price": float(k1h[i]["c"]),
                     "ts": int(k1h[i]["t"]),
                 }
+                self._last_good[s] = out[s]  # 【P0-5】记录 last-good
             except Exception as e:
-                logger.warning("[binance] %s 拉取失败: %s", s, e)
+                cached = self._last_good.get(s)
+                if cached is not None:
+                    out[s] = cached
+                    logger.warning("[binance] %s 拉取失败(%s)，降级用上次成功快照 ts=%d",
+                                   s, e, cached.get("ts"))
+                else:
+                    logger.warning("[binance] %s 拉取失败: %s", s, e)
                 continue
         return out
 

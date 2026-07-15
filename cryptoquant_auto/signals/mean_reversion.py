@@ -2,6 +2,10 @@
 
 逻辑：ADX<20 启动均值回归；资金费率绝对值 > 阈值(0.03%) 视为极端，
 反向入场捕捉费率回归。与趋势引擎互补（震荡市友好）。
+
+【P1-7 · LIVE · 勿删】本模块是生产信号路径活代码：signals/generator.py:68/91
+调用 gen_mean_reversion，signals/__init__.py 亦导出。圆桌曾误判为死代码，
+经核实为误判——保留。在线 walk-forward / PSI 监控降级 P2（见交接卡）。
 """
 from __future__ import annotations
 

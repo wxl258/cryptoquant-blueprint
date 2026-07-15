@@ -10,6 +10,7 @@ from enum import Enum
 
 class KillLevel(Enum):
     NORMAL = 0
+    WARN = 0.5           # 【P1-3】中段预警带：接近阈值但未触发，仅告警不限制新开
     L1_PAUSE_NEW = 1     # 暂停新开，持有仓按原计划管理
     L2_REDUCE = 2        # 降杠杆、缩减新仓
     L3_SURVIVE = 3       # 自动减仓，不自动全平
@@ -76,11 +77,18 @@ class KillSwitch:
             self.level = KillLevel.L1_PAUSE_NEW
             self.ack_required = True
             return
+        # 【P1-3】中段预警带：日亏 -1%~-3% / 回撤 -3%~-5% / 连亏 2 /
+        # 波动 1.8~2.5σ / API 失败 5%~10% → 进入 WARN，仅告警不限制（消除
+        # "零信号→突熔断"盲区，给人工介入留出窗口）。
+        if (self.daily_pnl <= -0.01 or self.peak_dd <= -0.03 or self.loss_streak >= 2
+                or self.btc_vol_sigma >= 1.8 or self.api_fail_rate >= 0.05):
+            self.level = KillLevel.WARN
+            return
         self.level = KillLevel.NORMAL
 
     def allows_new(self) -> bool:
-        """是否允许新开仓（L1 及以上即暂停新开）。"""
-        return self.level is KillLevel.NORMAL
+        """是否允许新开仓（L1 及以上即暂停新开；WARN 仅告警，仍允许）。"""
+        return self.level.value < KillLevel.L1_PAUSE_NEW.value
 
     def reduce_mode(self) -> bool:
         return self.level.value >= KillLevel.L2_REDUCE.value

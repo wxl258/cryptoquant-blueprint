@@ -8,6 +8,8 @@ import pytest
 from cryptoquant_auto.adapters.binance_testnet import BinanceTestnetAdapter
 from cryptoquant_auto.models import Direction
 from cryptoquant_auto.risk.constitution import TradingConstitution
+from cryptoquant_auto.risk.kill_switch import KillSwitch
+from cryptoquant_auto.risk.gate import GateConfig
 
 
 def _adapter():
@@ -140,7 +142,8 @@ def test_sync_skips_when_refresh_fails():
     a.refresh_open_orders = lambda: []
     called = []
     a.submit_market = lambda *x, **k: called.append((x, k)) or {"ok": True, "status": "FILLED"}
-    trades = sync_positions(a, {"XRP": "SHORT", "SOL": "LONG"}, {"XRP": 1.1, "SOL": 75.0})
+    trades = sync_positions(a, {"XRP": "SHORT", "SOL": "LONG"}, {"XRP": 1.1, "SOL": 75.0},
+                            KillSwitch(), GateConfig(equity=10_000_000, enforce_gate_b=False))
     assert trades == [], "刷新失败应跳过本轮"
     assert called == [], "刷新失败不应触发任何下单"
 
@@ -159,7 +162,8 @@ def test_sync_no_duplicate_existing_position():
     a.refresh_open_orders = lambda: []
     called = []
     a.submit_market = lambda *x, **k: called.append((x, k)) or {"ok": True, "status": "FILLED"}
-    trades = sync_positions(a, {"XRP": "SHORT", "SOL": "LONG"}, {"XRP": 1.1, "SOL": 75.0})
+    trades = sync_positions(a, {"XRP": "SHORT", "SOL": "LONG"}, {"XRP": 1.1, "SOL": 75.0},
+                            KillSwitch(), GateConfig(equity=10_000_000, enforce_gate_b=False))
     opened = [t["symbol"] for t in trades]
     assert "XRP" not in opened, "既有同向持仓不应重复开仓"
     assert "SOL" in opened, "新信号应开仓"

@@ -22,10 +22,13 @@
 """
 from __future__ import annotations
 
+import logging
 import math
 from typing import Dict, List, Optional
 
 import numpy as np
+
+logger = logging.getLogger("cryptoquant")
 
 try:
     from scipy.optimize import minimize, NonlinearConstraint, LinearConstraint
@@ -75,14 +78,14 @@ class CvarPositionOptimizer:
     """跨资产 CVaR 约束仓位优化器（scipy.optimize / SLSQP，带安全降级）。"""
 
     def __init__(self, alpha: float = 0.05, cvar_budget: float = -0.02,
-                 total_cap: float = 0.12, max_pos: float = 0.05,
+                 total_cap: float = 0.12, max_pos: float = 0.04,
                  min_samples: int = 24,
                  herfindahl_max: float = 0.5,
                  turnover_penalty: float = 0.0):
         self.alpha = alpha
         self.cvar_budget = cvar_budget      # 允许的最差尾均值（负数，如 -0.02）
         self.total_cap = total_cap          # 总仓位硬上限（如 0.12）
-        self.max_pos = max_pos              # 单币仓位上限（如 0.05）
+        self.max_pos = max_pos              # 单币仓位上限（单一真相源，与 gate/circuit_breaker/kelly 统一为 0.04）
         self.min_samples = min_samples      # 收益样本下限（不足→启发式）
         self.herfindahl_max = herfindahl_max  # 集中度上限 Σw² ≤ H_max（防过度集中）
         self.turnover_penalty = turnover_penalty  # 换手率惩罚系数 λ（>0 时启用）
@@ -123,8 +126,17 @@ class CvarPositionOptimizer:
         ref_vol = float(np.std(port_ret)) + 1e-12
         cur_vol = float(np.std(port_ret[-self.min_samples:])) + 1e-12
         adj = self.cvar_budget * (ref_vol / cur_vol)
-        return float(np.clip(adj, max(self.cvar_budget * 2, -0.10),
-                             min(self.cvar_budget * 0.5, -0.001)))
+        result = float(np.clip(adj, max(self.cvar_budget * 2, -0.10),
+                               min(self.cvar_budget * 0.5, -0.001)))
+        # 【P1-2】预算放宽（相对基准更宽松，result 比 cvar_budget 更接近 0）须记录，
+        # 便于审计「风险约束被放松」的触发原因（低波动 regime 下自适应放宽）。
+        if result > self.cvar_budget + 1e-9:
+            logger.info(
+                "CVaR budget widened: base=%.4f -> adj=%.4f "
+                "(ref_vol=%.4f cur_vol=%.4f)",
+                self.cvar_budget, result, ref_vol, cur_vol,
+            )
+        return result
 
     def solve(self, conviction: np.ndarray, R: np.ndarray,
               symbols: List[str],

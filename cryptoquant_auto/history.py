@@ -158,17 +158,27 @@ def resample(candles_1h: List[dict], n: int) -> List[dict]:
 
 
 # ---------------- 历史构建 ----------------
-def build_history(symbols: List[str] = SYMBOLS, limit: int = 1500,
-                  cache: str = CACHE, max_age: int = 3600) -> dict:
-    """抓取并缓存真实历史；1 小时内复用。返回 {symbol: {1h,4h,1w,fr,fng}}。"""
-    if os.path.exists(cache) and (time.time() - os.path.getmtime(cache)) < max_age:
+def build_history(symbols: List[str] = SYMBOLS, limit: int = 9000,
+                  cache: str = CACHE, max_age: int = 3600,
+                  force: bool = False) -> dict:
+    """抓取并缓存真实历史；max_age 秒内复用。
+
+    【P1-5】默认拉 9000 根 1h（约 375 天）→ resample(168) 后 1w 蜡烛 ≥52 根，
+    支撑诚实回测与 regime 分析（旧默认 1500 仅 ~8 周）。
+    force=True 时忽略缓存年龄、强制联网刷新（供 cron 定时刷新调用）。
+    返回 {symbol: {1h,4h,1w,fr,fng}}。
+    """
+    if (not force and os.path.exists(cache)
+            and (time.time() - os.path.getmtime(cache)) < max_age):
         with open(cache) as f:
             return json.load(f)
     hist: Dict[str, dict] = {}
     fng = fetch_fng(limit=0)
     for s in symbols:
         c = CONTRACT[s]
-        k1h = fetch_klines(c, "1h", limit)
+        # 【P1-5】拉满 limit 根 1h（分页 max_pages=10 → 至多 10000 根），
+        # 使 1w 蜡烛 ≥52 根。
+        k1h = fetch_klines(c, "1h", limit, max_pages=10)
         k4h = resample(k1h, 4)
         k1w = resample(k1h, 168)
         fr = fetch_funding(c)
@@ -398,4 +408,16 @@ def gen_real_signals_parallel(hist: dict, step: int = 12, warmup: int = 240,
         return out
     k = max(1, int(len(out) * float(split_frac)))
     return out[:k], out[k:]
+
+
+if __name__ == "__main__":
+    # 【P1-5】CLI 强制刷新历史缓存：python3 -m cryptoquant_auto.history
+    # 由每日 cron 调用，保证 1w 蜡烛持续 ≥52 根、数据不过期。
+    hist = build_history(force=True, limit=9000)
+    print(f"[history] 刷新完成，币种={len(hist)}")
+    for s, h in hist.items():
+        n1w = len(h.get("1w", []))
+        n1h = len(h.get("1h", []))
+        flag = "OK" if n1w >= 52 else "不足"
+        print(f"  {s}: 1h={n1h} 1w={n1w} ({flag})")
 

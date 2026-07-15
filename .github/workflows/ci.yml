@@ -28,6 +28,11 @@ jobs:
       - name: Pytest suite (63 项)
         run: python -m pytest tests/ -q
 
+      - name: Pytest suite — package (cryptoquant_auto/)
+        # 【P0-6】覆盖包内自带测试（含 test_testnet_receipt 风控接线、test_testnet_pnl
+        # 浮盈回归），与 tests/ 互为冗余校验，任一 ❌ 即失败、拦住合并/部署。
+        run: python -m pytest cryptoquant_auto/ -q
+
       - name: P1 fix verification (12 项)
         run: python verify_p1_fixes.py
 
