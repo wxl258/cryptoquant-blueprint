@@ -149,3 +149,42 @@
 - 依赖纪律：阶段0–2 零依赖；torch/LLM 后移，且必须带降级路径。
 - 我建的 `constitution.py` / `metacontroller.py` / `demo_blueprint_stage1.py` 是当前唯一可立即跑的代码资产，第一步就是先让它跑通并改 SPCI。
 - 本计划为 v1 实施版，随开发可迭代 v2。
+
+
+---
+
+## 八、实际落地修正（2026-07-15 · 实施后记录）
+
+实际实施与上述计划的偏离——计划不改，此处记录真实落地情况。
+
+### 阶段3 → 阶段4 重排序
+
+计划中阶段3（FinMem/4-role）先于阶段4（TSFM/CVaR/StockSim）。实际上因「无重算力」约束，阶段3 的真实 LLM 推理后移，阶段4 的 TSFM/CVaR/StockSim 提前落地。
+
+### TSFM（任务20）
+
+| 计划 | 实际 |
+|---|---|
+| Time-MoE / Moirai（零样本） | Chronos-Bolt-tiny(主,9M) + TimesFM 2.5(精度档,200M) |
+| 原型期小蒸馏版 | 保留为 numpy 兜底（DistilledTSFM） |
+| 预训练权重后移 | 已下载离线缓存（data/tsfm_cache/） |
+
+### CVaR（任务21）
+
+| 计划 | 实际 |
+|---|---|
+| DRL（RiskawareTrader） | scipy 解析解 + SLSQP，DRL 标为待重算力 |
+| — | 额外 6 项改进：Cornish-Fisher / Ledoit-Wolf / Vol-regime / DE 求解器 / Herfindahl / 换手率 |
+
+### StockSim（任务22）
+
+| 计划 | 实际 |
+|---|---|
+| LLM 驱动对手盘 | 9-agent 纯 numpy 委员会（6 角色 + 8 项事实 7/8） |
+| — | Kyle's λ + OFI + Hawkes + DFA Hurst + PanicAgent + LiqSeekerAgent |
+| — | HFTMarketMakerAgent（可用非默认） |
+
+### stage3（任务16-19）
+
+- meta/memory.py (FinMem)已实现，未改动
+- MockLLM 保持占位，真实 LLM 推理待有重算力环境
