@@ -380,6 +380,88 @@ class HFTMarketMakerAgent(MarketAgent):
         return orders
 
 
+
+class PanicAgent(MarketAgent):
+    """恐慌智能体：价格急跌时触发瀑布式抛售，模拟崩盘连锁反应。
+
+    处于蛰伏状态（概率 0.5%/步），一旦触发：
+    - price_return < -threshold 或连续 N 步下跌 + 波动突增
+    - 抛售恐慌：恐慌程度指数衰减（decay=0.85/步），初始 qty 大
+    - 形成正反馈：抛售→价格下跌→更多抛售
+    """
+
+    name = "panic"
+    def __init__(self, trigger_threshold: float = -0.008, panic_qty: float = 20.0,
+                 decay: float = 0.85, seed: int = 0):
+        self.threshold = trigger_threshold
+        self.panic_qty = panic_qty
+        self.decay = decay
+        self.rng = np.random.default_rng(seed)
+        self.panic_level = 0.0
+        self.consec_drop = 0
+    def reset(self):
+        self.panic_level = 0.0; self.consec_drop = 0
+    def produce(self, state):
+        prices = state["prices"]
+        if len(prices) < 5: return None
+        ret = (prices[-1] - prices[-5]) / (prices[-5] + 1e-12)
+        # 连续下跌计数
+        if len(prices) >= 3 and prices[-1] < prices[-3]:
+            self.consec_drop += 1
+        else:
+            self.consec_drop = 0
+        # 触发条件
+        if self.panic_level <= 0:
+            if ret < self.threshold and self.consec_drop >= 2:
+                self.panic_level = 1.0
+            elif self.consec_drop >= 4:
+                self.panic_level = 0.5
+            else:
+                return None
+        # 恐慌中
+        qty = self.panic_qty * self.panic_level * (1.0 + 0.5 * self.rng.random())
+        self.panic_level *= self.decay
+        if self.panic_level < 0.05:
+            self.panic_level = 0.0
+        return ("SELL", max(0.1, qty), "MARKET", None)
+
+
+class LiquiditySeekerAgent(MarketAgent):
+    """流动性寻求者：分步执行大单（TWAP 切片），制造大额冲击。
+
+    方向由 OFI 和近期趋势决定。
+    每步切片 = total_qty / n_slices，连续执行 n_slices 步后重置。
+    """
+
+    name = "liq_seeker"
+    def __init__(self, total_qty: float = 60.0, n_slices: int = 15,
+                 min_interval: int = 5, seed: int = 0):
+        self.total_qty = total_qty
+        self.n_slices = n_slices
+        self.min_interval = min_interval
+        self.rng = np.random.default_rng(seed)
+        self._remaining = 0.0
+        self._side = "BUY"
+        self._cooldown = 0
+    def reset(self):
+        self._remaining = 0.0; self._cooldown = 0
+    def produce(self, state):
+        prices = state["prices"]
+        ofi = state.get("ofi", 0.0)
+        self._cooldown = max(0, self._cooldown - 1)
+        # 当前切片执行完毕或 cooldown=0 → 启动新一笔
+        if self._remaining <= 0 and self._cooldown <= 0 and len(prices) >= 10:
+            self._side = "BUY" if ofi > 0 else "SELL"
+            self._remaining = self.total_qty * (0.8 + 0.4 * self.rng.random())
+            self._cooldown = self.min_interval
+        if self._remaining <= 0:
+            return None
+        slice_qty = min(self._remaining, self.total_qty / self.n_slices
+                        * (0.5 + self.rng.random()))
+        self._remaining -= slice_qty
+        return (self._side, max(0.1, slice_qty), "MARKET", None)
+
+
 class CouncilMarketAgent:
     """多智能体委员会：管理多个 MarketAgent，每步汇总订单流。
     
@@ -401,7 +483,7 @@ class CouncilMarketAgent:
             MomentumAgent(seed=0), MomentumAgent(seed=1, threshold=0.003),
             MeanRevAgent(seed=0), MeanRevAgent(seed=1, lookback=40, z_entry=2.0),
             FundamentalAgent(seed=0), FundamentalAgent(seed=1, fair_vol=0.008),
-            NoiseAgent(seed=0), NoiseAgent(seed=1, herd_strength=0.5),
+            PanicAgent(seed=0), LiquiditySeekerAgent(seed=0),
             MarketMakerAgent(seed=0),
         ]
     def reset(self):
@@ -599,6 +681,28 @@ def measure_stylized_facts(prices: List[float], volumes: List[float]
         "has_long_memory": hurst > 0.55 and vl5 > 0.1 and vl10 > 0.05,
         "has_no_linear_acf": abs(acf_ret1) < 0.05,
     }
+    # 8) 聚合高斯性：峰度随聚合尺度递减（多时间尺度一致性）
+    aggr_kurts = []
+    for scale in [1, 2, 4, 8, 16]:
+        if n // scale >= 10:
+            r_s = rets.reshape(-1, scale).sum(axis=1) if scale > 1 else rets
+            aggr_kurts.append(float(np.mean(r_s**4) / (np.mean(r_s**2)**2 + 1e-12) - 3.0))
+        else:
+            aggr_kurts.append(None)
+    aggr_decreasing = all(aggr_kurts[i] is not None and aggr_kurts[i+1] is not None
+                           and aggr_kurts[i] > aggr_kurts[i+1] * 0.8
+                           for i in range(len(aggr_kurts) - 1) if aggr_kurts[i] is not None and aggr_kurts[i+1] is not None)
+
+    flags = {
+        "fat_tails": kurt > 1.0,
+        "vol_clustering": acf_abs1 > 0.05,
+        "volume_autocorr": acf_vol > 0.05,
+        "has_leverage": leverage_corr < 0.0,
+        "has_vol_vol_corr": vol_vol_corr > 0.1,
+        "has_long_memory": hurst > 0.55 and vl5 > 0.1 and vl10 > 0.05,
+        "has_no_linear_acf": abs(acf_ret1) < 0.05,
+        "has_aggr_gaussianity": aggr_decreasing,
+    }
     return {
         "n": n,
         "excess_kurtosis": round(kurt, 3),
@@ -610,6 +714,11 @@ def measure_stylized_facts(prices: List[float], volumes: List[float]
         "vol_acf5": round(vl5, 3),
         "vol_acf10": round(vl10, 3),
         "return_acf1": round(acf_ret1, 3),
+        "kurt_agg1": round(aggr_kurts[0], 3) if aggr_kurts[0] is not None else None,
+        "kurt_agg2": round(aggr_kurts[1], 3) if aggr_kurts[1] is not None else None,
+        "kurt_agg4": round(aggr_kurts[2], 3) if aggr_kurts[2] is not None else None,
+        "kurt_agg8": round(aggr_kurts[3], 3) if aggr_kurts[3] is not None else None,
+        "kurt_agg16": round(aggr_kurts[4], 3) if aggr_kurts[4] is not None else None,
         **flags,
         "n_stylized_facts": sum(flags.values()),
     }
