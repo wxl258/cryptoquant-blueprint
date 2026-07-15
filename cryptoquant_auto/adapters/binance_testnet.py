@@ -47,6 +47,7 @@ class BinanceTestnetAdapter(ExchangeAdapter):
         self.open_orders: dict[str, Order] = {}
         self.positions: dict[str, Position] = {}
         self.fills: list[Fill] = []
+        self._leverage_set: set[str] = set()  # 已设杠杆的币对（避免每轮重复 API 调用）
 
     # ---- 签名 ----
     def _sign(self, params: dict) -> dict:
@@ -63,6 +64,29 @@ class BinanceTestnetAdapter(ExchangeAdapter):
     @staticmethod
     def _sym(s: str) -> str:
         return f"{s}USDT"
+
+    def _ensure_leverage(self, symbol: str, leverage: int) -> None:
+        """确保该币对杠杆倍数正确（仅对首次交易的币对发起 API 调用，避免每轮浪费请求）。
+
+        不设杠杆时，币安使用账户默认值（测试网常为 0x/未定义），导致保证金显示 0、
+        实际杠杆与预期不符。本方法在首次下单前调用一次即可。
+        """
+        if symbol in self._leverage_set:
+            return
+        try:
+            r = self.sess.post(BASE + "/fapi/v1/leverage",
+                               params=self._sign({"symbol": self._sym(symbol),
+                                                  "leverage": leverage}),
+                               timeout=self._timeout)
+            if r.status_code == 200:
+                self._leverage_set.add(symbol)
+                logger.info("[leverage] %s → %dx (已设)", symbol, leverage)
+            else:
+                logger.warning("[leverage] %s 设杠杆 http=%d: %s", symbol, r.status_code, r.text[:100])
+        except Exception as e:
+            logger.warning("[leverage] %s 设杠杆异常: %s (继续交易)", symbol, e)
+            # 设杠杆失败不阻断交易（测试网默认值也能成交，只是杠杆不对）
+
 
     # ---- 下单 ----
     def submit(self, order: Order) -> Order:

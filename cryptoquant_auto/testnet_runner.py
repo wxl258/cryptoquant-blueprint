@@ -33,10 +33,11 @@ from .risk.kill_switch import KillSwitch
 logger = logging.getLogger("cryptoquant.testnet")
 
 # 配置参数（可通过环境变量覆盖）
-POS_SIZE_USDT = int(os.getenv("CRYPTOQUANT_POS_SIZE", "100"))   # 每币基柱 USDT
-LEVERAGE = int(os.getenv("CRYPTOQUANT_LEVERAGE", "2"))           # 杠杆倍数
+POS_SIZE_USDT = int(os.getenv("CRYPTOQUANT_POS_SIZE", "100"))   # 每币基柱名义 USDT（保证金基数）
+LEVERAGE = int(os.getenv("CRYPTOQUANT_LEVERAGE", "2"))           # 目标杠杆倍数（会通过 API 通知币安）
 # 测试网账户权益（gate 单币/总仓比例 + KillSwitch 日亏比例的基准）。
 # 默认 5000 → 固定 200USDT 单币 ≈ 4% 对齐 SINGLE_CAP_PCT，使闸门阈值有意义。
+# 注意：POS_SIZE_USDT × LEVERAGE 决定名义敞口，实际保证金 = POS_SIZE_USDT。
 EQUITY_USDT = float(os.getenv("CRYPTOQUANT_EQUITY_USDT", "5000"))
 
 # 币安 USDT-M 合约 LOT_SIZE 步长（api/v1/exchangeInfo 可查，硬编码省一次 API 调用）
@@ -238,6 +239,8 @@ def sync_positions(adapter: BinanceTestnetAdapter,
         if sym not in prices or not prices[sym]:
             continue
         price = prices[sym]
+        # 首次交易该币前设杠杆（确保币安实际杠杆与配置一致，否则保证金显示 0）
+        adapter._ensure_leverage(sym, LEVERAGE)
         cur = positions_map.get(sym)
         cur_dir = None
         if cur and cur.qty > 1e-9:
