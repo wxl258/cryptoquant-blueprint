@@ -241,16 +241,37 @@ def _save_fill_history(history: List[dict]) -> None:
 
 
 def _daily_realized_pnl() -> float:
-    """当日（自然日 00:00 起）已实现盈亏（USDT）。供 KillSwitch 日亏熔断用。
+    """当日（自然日 00:00 起）已平仓回合的真实盈亏（USDT）。供 KillSwitch 日亏熔断用。
 
-    按自然日重置，避免把长期累计微亏误触 L2；与 ExecutionEngine._realized_day 同口径。
+    FIFO 逐币匹配 BUY/SELL，仅统计「当日发生平仓(SELL)且对应 BUY 已匹配」的回合盈亏，
+    并扣平仓腿双边手续费；仍持有仓位的建仓成本不计入。与行业「已实现盈亏」一致，
+    避免把开仓占用的本金误记为当日亏损、虚假触发 L2_REDUCE（修复纯开仓日误冻）。
     """
     history = _load_fill_history()
     today_start = datetime.combine(datetime.now().date(), _dtime.min).timestamp()
-    # 【P0 符号修复】已实现 = Σ(卖出台约 proceeds) − Σ(买入成本)：SELL 记正、BUY 记负，
-    # 末位**不再**取负。此前多乘 -1 使符号整体反，会把盈利日误判为亏损、误触发 L1 日亏熔断。
-    return sum(f["price"] * f["qty"] * (1 if f["side"] == "SELL" else -1)
-               for f in history if float(f.get("ts", 0)) >= today_start)
+    lots: Dict[str, list] = {}            # symbol -> [[price, qty], ...] 未平 BUY 批次
+    daily = 0.0
+    for f in sorted(history, key=lambda x: float(x.get("ts", 0))):
+        ts = float(f.get("ts", 0))
+        sym = f["symbol"]
+        price = float(f["price"])
+        qty = float(f["qty"])
+        notional = price * qty
+        if f["side"] == "BUY":
+            lots.setdefault(sym, []).append([price, qty])
+        else:  # SELL 平仓：与最早未平 BUY 批次 FIFO 配对
+            remaining = qty
+            for lot in lots.get(sym, []):
+                if remaining <= 0:
+                    break
+                take = min(lot[1], remaining)
+                if ts >= today_start:
+                    daily += (price - lot[0]) * take
+                lot[1] -= take
+                remaining -= take
+            if ts >= today_start:
+                daily -= notional * FEE_RATE_TAKER
+    return daily
 
 
 def _close_position(adapter: BinanceTestnetAdapter, sym: str,
