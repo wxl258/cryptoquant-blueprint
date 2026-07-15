@@ -100,11 +100,13 @@ class BinanceTestnetAdapter(ExchangeAdapter):
             params.update(type="LIMIT", price=str(order.price),
                           timeInForce="GTX" if order.post_only else "GTC")
         elif order.otype is OrderType.TP:
-            params.update(type="TAKE_PROFIT", stopPrice=str(order.price),
-                          price=str(order.price), timeInForce="GTC")
+            # 止盈市价单：仅设 stopPrice，不设 limit price（确保触发即成交）
+            params.update(type="TAKE_PROFIT_MARKET", stopPrice=str(order.price),
+                          closePosition=True)
         elif order.otype is OrderType.SL:
-            params.update(type="STOP", stopPrice=str(order.price),
-                          price=str(order.price), timeInForce="GTC")
+            # 止损市价单：仅设 stopPrice，不设 limit price（确保触发即成交）
+            params.update(type="STOP_MARKET", stopPrice=str(order.price),
+                          closePosition=True)
         elif order.otype is OrderType.REDUCE:
             # 【P1-8 修复】L3 生存态减仓单：市价减仓（不挂限价，确保生存态能真正减仓）。
             # 原实现缺此分支 → REDUCE 无 type/price → 真实路径拒单/异常，减仓失效。

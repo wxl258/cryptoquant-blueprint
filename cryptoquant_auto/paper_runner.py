@@ -481,6 +481,46 @@ def _optimize_positions(opt, mu: Dict[str, float], rets: Dict[str, Optional[np.n
     return {s: wdict.get(s, 0.0) for s in mu}
 
 
+def _tweak_confidence_from_testnet(verdict, symbol: str,
+                                    mu: Dict[str, float]) -> None:
+    """【P1】testnet PnL 反馈：实时盈亏修正置信度与 mu。
+
+    读取 testnet_state.json（由 testnet_runner 每轮写入），对该币未实现盈亏
+    做反馈：浮亏大 → 压置信度（仓位自然降低）；浮盈大 → 提置信度（仓位自然提高）。
+    """
+    testnet_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "paper", "testnet_state.json")
+    if not os.path.exists(testnet_path):
+        return
+    try:
+        import json
+        with open(testnet_path) as f:
+            state = json.load(f)
+        for pos in state.get("positions", []):
+            if pos.get("symbol") == symbol:
+                upnl = pos.get("unrealized_pnl", 0)
+                entry = pos.get("entry_price", 0) or 1
+                pos_value = pos.get("qty", 0) * entry
+                if pos_value <= 0:
+                    continue
+                upnl_frac = upnl / pos_value
+                factor = 1.0
+                if upnl_frac < -0.03:
+                    factor = 0.7      # 浮亏>3% -> 置信度 x0.7
+                elif upnl_frac < -0.01:
+                    factor = 0.85     # 浮亏1-3% -> 置信度 x0.85
+                elif upnl_frac > 0.05:
+                    factor = 1.15     # 浮盈>5% -> 置信度 x1.15
+                if factor != 1.0:
+                    old_conf = verdict.confidence
+                    verdict.confidence = min(0.95, max(0.05, verdict.confidence * factor))
+                    mu[symbol] = verdict.direction_int() * verdict.confidence
+                    logger.info("  [PnL反馈] %s upnl=%.2f(%.1f%%) 置信 %.3f->%.3f (x%.2f)",
+                                symbol, upnl, upnl_frac * 100, old_conf, verdict.confidence, factor)
+    except Exception as e:
+        logger.warning("[PnL反馈] %s 读取 testnet_state 异常: %s", symbol, e)
+
+
 def run_once(source: DataSource, council: FourRoleCouncil,
              constitution: TradingConstitution, memory: FinMemMemory,
              conformal=None, forecaster=None, cvar_optimizer=None) -> List[dict]:
@@ -508,6 +548,8 @@ def run_once(source: DataSource, council: FourRoleCouncil,
         verdicts[sym] = (verdict, fc, d)
         # 方向×置信 → 卷积代理（带符号）；CVaR 优化器取绝对值作奖励，方向并入收益矩阵
         mu[sym] = verdict.direction_int() * verdict.confidence
+        # 【P1】testnet PnL 反馈：实时盈亏修置信度（亏钱币降仓位，赚钱币提仓位）
+        _tweak_confidence_from_testnet(verdict, sym, mu)
         rets[sym] = _symbol_returns(sym, CVaR_LOOKBACK)
     # ---- 跨资产 CVaR 仓位优化（路线图 B：替换线性仓位公式）----
     weights = _optimize_positions(cvar_optimizer, mu, rets, verdicts)
