@@ -74,22 +74,55 @@ def _fmt_price(symbol: str, price: float) -> float:
 PAPER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "paper")
 
 
-def _load_paper_signals() -> Dict[str, str]:
-    """解析 paper_state.json 产出 {symbol: LONG/SHORT/HOLD}。"""
+def _calc_leverage(confidence: float, regime: str, ks_level) -> int:
+    """动态杠杆：行情越好（高置信、强趋势、无风险）→ 杠杆越高。
+
+    公式：leverage = 10 × regime_mult × conf_mult × ks_mult [clamped 1~20]
+    - regime_mult: TREND=1.5 / RANGE=1.0 / CRASH=0.5
+    - conf_mult: 0.5 + confidence (conf 0~1 → mult 0.5~1.5)
+    - ks_mult: L0=1.0 / WARN=0.8 / L1=0.5 / L2=0.3 / L3=0.1
+
+    示例：
+      TREND+高置信(0.8)+L0  = 10×1.5×1.3×1.0 = 19.5 → 20x 🟢
+      RANGE+中置信(0.4)+L0  = 10×1.0×0.9×1.0 = 9 → 9x 🟡
+      CRASH+低置信(0.2)+L2  = 10×0.5×0.7×0.3 = 1.05 → 1x 🔴
+    """
+    regime_mult = {"TREND": 1.5, "RANGE": 1.0, "CRASH": 0.5}.get(regime, 1.0)
+    conf_mult = max(0.5, min(1.5, 0.5 + confidence))
+    ks_val = ks_level.value if hasattr(ks_level, "value") else float(ks_level)
+    ks_mult = {0: 1.0, 0.5: 0.8, 1.0: 0.5, 2.0: 0.3, 3.0: 0.1}.get(ks_val, 1.0)
+    raw = 10.0 * regime_mult * conf_mult * ks_mult
+    return max(1, min(20, int(round(raw))))
+
+
+def _load_paper_signals() -> tuple[Dict[str, str], Dict[str, dict]]:
+    """解析 paper_state.json 产出 (signals, details)。
+
+    signals: {symbol: LONG/SHORT/HOLD}
+    details: {symbol: {confidence, regime, proposed_exposure, cvar_pct}}
+    """
     path = os.path.join(PAPER_DIR, "paper_state.json")
     if not os.path.exists(path):
         logger.warning("paper_state.json 不存在，跳过本轮测试网同步")
-        return {}
+        return {}, {}
     with open(path) as f:
         data = json.load(f)
     signals: Dict[str, str] = {}
+    details: Dict[str, dict] = {}
     for r in data.get("records", []):
+        sym = r["symbol"]
         act = r.get("action", "HOLD")
         if act in ("LONG", "SHORT", "HOLD"):
-            signals[r["symbol"]] = act
+            signals[sym] = act
         else:
-            signals[r["symbol"]] = "HOLD"
-    return signals
+            signals[sym] = "HOLD"
+        details[sym] = {
+            "confidence": r.get("confidence", 0.3),
+            "regime": r.get("regime", "RANGE"),
+            "proposed_exposure": r.get("proposed_exposure", 0.0),
+            "cvar_pct": r.get("cvar_pct", 0.0),
+        }
+    return signals, details
 
 
 def _fetch_prices(symbols: List[str]) -> Dict[str, float]:
@@ -220,7 +253,8 @@ def sync_positions(adapter: BinanceTestnetAdapter,
                     signals: Dict[str, str],
                     prices: Dict[str, float],
                     kill_switch: KillSwitch,
-                    gate_cfg: GateConfig) -> List[dict]:
+                    gate_cfg: GateConfig,
+                    details: Dict[str, dict] = None) -> List[dict]:
     """根据最新信号同步测试网持仓（跨 run 持久化真实持仓/挂单）。
 
     修复：先拉测试网真实持仓与挂单，否则每轮从空开始会重复开单、无力平仓历史单；
@@ -239,8 +273,11 @@ def sync_positions(adapter: BinanceTestnetAdapter,
         if sym not in prices or not prices[sym]:
             continue
         price = prices[sym]
-        # 首次交易该币前设杠杆（确保币安实际杠杆与配置一致，否则保证金显示 0）
-        adapter._ensure_leverage(sym, LEVERAGE)
+        # 动态杠杆：根据行情/置信/KillSwitch 算最佳杠杆
+        dd = (details or {}).get(sym, {})
+        lev = _calc_leverage(dd.get("confidence", 0.3), dd.get("regime", "RANGE"),
+                            kill_switch.level)
+        adapter._ensure_leverage(sym, lev)
         cur = positions_map.get(sym)
         cur_dir = None
         if cur and cur.qty > 1e-9:
@@ -277,7 +314,7 @@ def sync_positions(adapter: BinanceTestnetAdapter,
         if open_dir == action:
             logger.info("  [testnet] %s 已有同方向挂单, 跳过开仓", sym)
             continue
-        qty = _fmt_qty(sym, POS_SIZE_USDT * LEVERAGE / price)
+        qty = _fmt_qty(sym, POS_SIZE_USDT * lev / price)
         if qty < 0.001:
             logger.warning("  [testnet] %s qty=%s 过小跳过", sym, qty)
             continue
@@ -371,7 +408,7 @@ def main() -> int:
         return 1
 
     # 读取信号
-    signals = _load_paper_signals()
+    signals, paper_detail = _load_paper_signals()
     if not signals:
         logger.info("paper_state.json 无信号，跳过本轮")
         return 0
@@ -396,7 +433,7 @@ def main() -> int:
                 EQUITY_USDT, daily_rp, daily_pnl * 100, ks.level.name)
 
     # 同步持仓
-    trades = sync_positions(adapter, signals, prices, ks, gate_cfg)
+    trades = sync_positions(adapter, signals, prices, ks, gate_cfg, details=paper_detail)
     logger.info("  本轮操作 %d 笔", len(trades))
 
     # 输出
